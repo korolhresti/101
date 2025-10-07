@@ -1,3 +1,8 @@
+# Build tools
+pip>=25.2
+setuptools>=68.0.0
+wheel>=0.40.0
+
 # Telegram bot
 aiogram==3.2.0
 
@@ -23,14 +28,10 @@ orjson==3.9.1
 # Date and time
 python-dateutil==2.8.2
 
-# NLP / AI (Transformers, no Rust compilation needed)
+# NLP / AI (Transformers, CPU only)
 transformers==4.40.2
-
-# Optional dependencies for Transformers
 huggingface-hub==0.14.1
 numpy==1.25.0
 packaging==23.1
 regex==2025.9.18
-
-# Optional: for better speed in Transformers tokenization (pre-built wheel)
 tokenizers==0.19.0
