@@ -1,6 +1,15 @@
+# Telegram bot framework
 aiogram==3.22.0
-asyncpg==0.30.2
-aiohttp==3.9.5
-feedparser==6.0.11
-beautifulsoup4==4.12.3
+
+# PostgreSQL async driver
+asyncpg==0.30.0
+
+# HTTP requests & parsing
+aiohttp==3.9.4
+beautifulsoup4==4.12.2
+newspaper3k==0.2.8
 sgmllib3k==1.0.0
+
+# Optional utilities
+python-dotenv==1.0.0
+lxml==4.9.3
