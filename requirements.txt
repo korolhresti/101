@@ -1,10 +1,36 @@
+# Telegram bot
 aiogram==3.2.0
+
+# Async PostgreSQL
 asyncpg==0.30.0
+
+# HTML parsing
 beautifulsoup4==4.12.2
-newspaper3k==0.2.8
 lxml==4.9.3
+newspaper3k==0.2.8
 requests==2.32.0
 aiohttp==3.9.3
+
+# Environment variables
 python-dotenv==1.0.0
 
---prefer-binary
+# Translation
+translate==3.6.1
+
+# JSON processing
+orjson==3.9.1
+
+# Date and time
+python-dateutil==2.8.2
+
+# NLP / AI (Transformers, no Rust compilation needed)
+transformers==4.40.2
+
+# Optional dependencies for Transformers
+huggingface-hub==0.14.1
+numpy==1.25.0
+packaging==23.1
+regex==2025.9.18
+
+# Optional: for better speed in Transformers tokenization (pre-built wheel)
+tokenizers==0.19.0
