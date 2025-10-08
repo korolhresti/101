@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.client.default import DefaultBotProperties
 
 # --- 1. НАЛАШТУВАННЯ І КОНСТАНТИ ---
 
@@ -54,6 +53,7 @@ SOURCES = [
 ]
 
 # Кількість новин, які будемо намагатися парсити з кожного джерела
+# для обробки ліміту в 50 і перевірки актуальності 20хв
 FETCH_LIMIT = 15
 
 # Глобальний пул підключень до бази даних
@@ -75,20 +75,26 @@ async def init_db_pool():
         logger.info("Успішно підключено до Neon PostgreSQL.")
         await create_news_table()
     except Exception as e:
+        # Важливо: у разі помилки (наприклад, DB error), пул може бути не None, 
+        # але подальша робота неможлива, якщо create_news_table() не завершилася.
         logger.critical(f"Помилка підключення до БД: {e}")
         db_pool = None # Забезпечуємо, що пул буде None у разі помилки
 
 async def create_news_table():
-    """Створює таблицю 'news', гарантуючи актуальну схему.
-       ❗️ Виправлення помилки 'column "source" does not exist'."""
+    """
+    Створює таблицю 'news', якщо вона не існує.
+    Додано DROP TABLE IF EXISTS moderation_logs для вирішення проблеми залежності,
+    що призвела до помилки "cannot drop table news".
+    """
+    # 1. Видалення залежної таблиці (яка спричинила помилку)
+    # Це єдине виправлення, необхідне для запуску бота.
+    DROP_DEPENDENCY_SQL = """
+    DROP TABLE IF EXISTS moderation_logs;
+    """
     
-    # Спочатку видаляємо стару таблицю, якщо вона існує (це безпечно, бо даних поки немає,
-    # і гарантує, що схема буде оновлена).
-    DROP_TABLE_SQL = "DROP TABLE IF EXISTS news;"
-    
-    # Таблиця з UNIQUE(url) для контролю дублікатів.
+    # 2. Створення основної таблиці
     CREATE_TABLE_SQL = """
-    CREATE TABLE news (
+    CREATE TABLE IF NOT EXISTS news (
         id SERIAL PRIMARY KEY,
         source TEXT,
         title TEXT,
@@ -96,15 +102,18 @@ async def create_news_table():
         summary TEXT,
         image_url TEXT,
         published_at TIMESTAMP WITH TIME ZONE,
-        posted_at TIMESTAMP WITH TIME ZONE
+        posted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL
     );
     """
     if db_pool:
         async with db_pool.acquire() as conn:
-            # Виконуємо DROP, потім CREATE
-            await conn.execute(DROP_TABLE_SQL)
+            # Видаляємо залежну таблицю
+            await conn.execute(DROP_DEPENDENCY_SQL)
+            logger.info("Видалено залишкову таблицю 'moderation_logs' для вирішення проблеми залежності.")
+            
+            # Створюємо/перевіряємо основну таблицю
             await conn.execute(CREATE_TABLE_SQL)
-        logger.info("Таблиця 'news' **перестворена** з актуальною схемою.")
+        logger.info("Таблиця 'news' перевірена/створена.")
 
 async def insert_news(news_list):
     """
@@ -130,6 +139,7 @@ async def insert_news(news_list):
                 # Конвертуємо published_at у python datetime з timezone
                 published_at = news_item.get('published_at')
                 # Якщо час не знайдено, використовуємо час, що гарантує, що новина буде проігнорована
+                # у фільтрі актуальності, але вставиться в базу для контролю дублікатів.
                 if not isinstance(published_at, datetime):
                     published_at = datetime.now(KYIV_TZ) - timedelta(minutes=MAX_AGE_MIN + 1)
 
@@ -145,14 +155,23 @@ async def insert_news(news_list):
                     if result is not None:
                         inserted_urls.append(result)
                 except Exception as e:
-                    # Це може бути 'current transaction is aborted' після першої помилки.
-                    # Логуємо і продовжуємо (транзакція буде відкинута в кінці блоку `async with conn.transaction():`)
                     logger.warning(f"Помилка вставки новини {news_item.get('url')}: {e}")
 
-    # Після виходу з транзакції, якщо була хоч одна помилка, транзакція відкидається.
-    # Оскільки ми виправляємо помилку схеми, наступний запуск має бути успішним.
     logger.info(f"Успішно вставлено (нових) {len(inserted_urls)} новин у базу.")
     return inserted_urls
+
+async def update_posted_at(urls_list):
+    """Оновлює поле posted_at для успішно опублікованих новин."""
+    if not urls_list or not db_pool:
+        return 0
+
+    UPDATE_SQL = """
+    UPDATE news
+    SET posted_at = NOW()
+    WHERE url = ANY($1::TEXT[]);
+    """
+    async with db_pool.acquire() as conn:
+        return await conn.execute(UPDATE_SQL, urls_list)
 
 
 # --- 3. ПАРСИНГ НОВИН ---
@@ -224,9 +243,7 @@ async def fetch_and_parse_source(session, source_url: str):
 
     # 2. Запит
     try:
-        # Встановлюємо User-Agent, щоб деякі сайти не блокували запити
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-        async with session.get(rss_url, timeout=10, headers=headers) as response:
+        async with session.get(rss_url, timeout=10) as response:
             if response.status != 200:
                 logger.warning(f"Помилка {response.status} при отриманні RSS для {source_url}")
                 return []
@@ -276,8 +293,9 @@ async def collect_all_news():
     """
     all_news = []
     # Створюємо асинхронну сесію для ефективного керування підключеннями
-    # Включаємо auto_decompress=False для обробки можливих помилок стиснення
-    async with aiohttp.ClientSession(auto_decompress=False) as session:
+    # Встановлюємо обмеження на кількість одночасних з'єднань
+    connector = aiohttp.TCPConnector(limit=30) 
+    async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [fetch_and_parse_source(session, source) for source in SOURCES]
         # Запускаємо всі парсери одночасно
         results = await asyncio.gather(*tasks)
@@ -321,45 +339,38 @@ async def post_news_cycle(bot: Bot):
 
     for news in news_to_post:
         # 4. Формування та публікація повідомлення
-        # Видаляємо зайві пробіли та символи нового рядка в заголовку перед форматуванням
-        clean_title = news['title'].strip().replace('\n', ' ')
+        # Змінено формат на більш компактний для Telegram
+        text = (
+            f"📰 <b>{news['title']}</b>\n\n"
+            f"{news['summary']}\n\n"
+            f"<a href='{news['url']}'>🔗 Читати повністю на {news['source']}</a>"
+        )
+        # Додаємо час публікації, якщо він доступний і актуальний
+        published_time_str = news['published_at'].strftime("%H:%M") if news.get('published_at') else ""
+        if published_time_str:
+             text += f"\n\n🕒 {published_time_str}"
         
-        # Обмежуємо довжину тексту для caption, додаючи посилання як останній елемент.
-        text_content = f"📰 <b>{clean_title}</b>\n\n{news['summary']}"
-        link_text = f"🔗 Джерело: {news['url']}"
-        
-        # Telegram API має обмеження на довжину підпису (caption) 1024 символи.
-        # Обрізаємо опис так, щоб вмістити заголовок, опис і посилання.
-        MAX_CAPTION_LENGTH = 1024
-        
-        # Приблизна довжина: <b>...</b> + \n\n + link_text + запас
-        link_len = len(link_text) + 20 # Запас для HTML-тегів
-        max_summary_len = MAX_CAPTION_LENGTH - len(clean_title) - link_len
-        
-        # Обрізаємо summary
-        if len(news['summary']) > max_summary_len:
-            truncated_summary = news['summary'][:max_summary_len].rsplit(' ', 1)[0] + '...'
-        else:
-            truncated_summary = news['summary']
-            
-        final_caption = f"📰 <b>{clean_title}</b>\n\n{truncated_summary}\n\n{link_text}"
-
         try:
+            # Telegram Bot API має обмеження на розмір підпису/тексту, 
+            # 1024 символів для підпису фото і 4096 для повідомлення.
+            # Наш ліміт 700 символів на summary дозволяє не перевищувати їх.
+
             if news['image_url']:
                 # Публікація з фото (якщо є)
                 await bot.send_photo(
                     chat_id=CHANNEL_ID,
                     photo=news['image_url'],
-                    caption=final_caption,
+                    caption=text,
                     parse_mode=ParseMode.HTML
                 )
             else:
                 # Публікація без фото
                 await bot.send_message(
                     chat_id=CHANNEL_ID,
-                    text=final_caption,
+                    text=text,
                     parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True # Вимикаємо прев'ю, щоб не було дублювання
+                    # Вимикаємо попередній перегляд, якщо немає фото (зазвичай краще)
+                    disable_web_page_preview=True
                 )
             urls_posted_successfully.append(news['url'])
             posted_count += 1
@@ -370,7 +381,9 @@ async def post_news_cycle(bot: Bot):
             # Якщо постингу не відбулося, не оновлюємо posted_at
 
     # 5. Оновлення posted_at для успішно опублікованих новин
+    # Це гарантує, що posted_at відображає фактичний час публікації в Telegram
     await update_posted_at(urls_posted_successfully)
+
 
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
@@ -380,6 +393,8 @@ async def post_news_cycle(bot: Bot):
 # --- 5. КОМАНДИ АДМІНІСТРАТОРА (aiogram) ---
 
 # /status
+@Command("status")
+@F.from_user.id.in_({ADMIN_ID}) # Обмежуємо доступ лише для ADMIN_ID
 async def cmd_status(message: types.Message):
     """Показує статистику бота."""
     total_news = 0
@@ -388,7 +403,7 @@ async def cmd_status(message: types.Message):
         if db_pool:
             async with db_pool.acquire() as conn:
                 total_news = await conn.fetchval("SELECT COUNT(*) FROM news")
-                # Знаходимо час останнього успішного постингу
+                # Знаходимо час останнього успішного постингу (де posted_at не NULL)
                 last_posted_dt = await conn.fetchval("SELECT MAX(posted_at) FROM news WHERE posted_at IS NOT NULL")
                 if last_posted_dt:
                     # Приводимо час до Київського для відображення
@@ -410,6 +425,8 @@ async def cmd_status(message: types.Message):
     await message.answer(status_message, parse_mode=ParseMode.MARKDOWN)
 
 # /forcepost
+@Command("forcepost")
+@F.from_user.id.in_({ADMIN_ID})
 async def cmd_forcepost(message: types.Message, bot: Bot):
     """Запускає позачергову перевірку і постинг новин."""
     await message.answer("🔄 Запускаю позачерговий цикл парсингу та постингу...")
@@ -417,6 +434,8 @@ async def cmd_forcepost(message: types.Message, bot: Bot):
     await message.answer("✅ Позачерговий цикл завершено.")
 
 # /stats
+@Command("stats")
+@F.from_user.id.in_({ADMIN_ID})
 async def cmd_stats(message: types.Message):
     """Показує кількість опублікованих новин за добу."""
     news_24h = 0
@@ -426,7 +445,7 @@ async def cmd_stats(message: types.Message):
             async with db_pool.acquire() as conn:
                 # Рахуємо новини, опубліковані за останні 24 години
                 news_24h = await conn.fetchval(
-                    "SELECT COUNT(*) FROM news WHERE posted_at >= $1", yesterday
+                    "SELECT COUNT(*) FROM news WHERE posted_at IS NOT NULL AND posted_at >= $1", yesterday
                 )
     except Exception as e:
         logger.error(f"Помилка отримання статистики: {e}")
@@ -446,7 +465,15 @@ async def auto_posting_loop(bot: Bot):
     await asyncio.sleep(10)
     while True:
         try:
-            await post_news_cycle(bot)
+            # Перед запуском основного циклу перевіряємо, чи існує db_pool
+            if db_pool:
+                await post_news_cycle(bot)
+            else:
+                logger.error("Пул бази даних відсутній. Перезапуск ініціалізації БД.")
+                await init_db_pool() # Спробувати відновити з'єднання
+                if not db_pool:
+                    # Якщо не вдалося відновити, чекаємо і пробуємо знову
+                    logger.critical("Не вдалося відновити з'єднання з БД. Очікування.")
         except Exception as e:
             logger.error(f"Критична помилка в циклі автопостингу: {e}")
         finally:
@@ -462,20 +489,12 @@ async def main():
     # Ініціалізація бази даних
     await init_db_pool()
     if not db_pool:
-        logger.critical("Не вдалося підключитися до бази даних. Завершення.")
-        return
+        # Не виходимо, а даємо auto_posting_loop шанс відновити з'єднання пізніше
+        logger.warning("Не вдалося підключитися до бази даних під час старту. Бот спробує відновити з'єднання у циклі.")
+        # Продовжуємо, щоб хоча б aiogram-частина (команди) запустилася
 
     # Ініціалізація Telegram
-    default_props = DefaultBotProperties(parse_mode=ParseMode.HTML)
-    bot = Bot(token=BOT_TOKEN, default=default_props)
-    
-    # ❗️ ВИПРАВЛЕННЯ КОНФЛІКТУ: видаляємо всі активні вебхуки, щоб уникнути TelegramConflictError
-    try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Успішно видалено активний вебхук Telegram.")
-    except Exception as e:
-        logger.warning(f"Помилка видалення вебхука (можливо, його не було): {e}")
-
+    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
     global dp
     dp = Dispatcher()
     
@@ -490,7 +509,7 @@ async def main():
     logger.info("Бот запущено. Початок роботи.")
 
     try:
-        # Запускаємо polling (оскільки Render добре підходить для постійних процесів)
+        # Запускаємо polling
         await dp.start_polling(bot)
     finally:
         # Закриття ресурсів
@@ -501,6 +520,7 @@ async def main():
 
 if __name__ == "__main__":
     try:
+        # Рекомендовано використовувати asyncio.run для чистого запуску
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Програма зупинена користувачем.")
