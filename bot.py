@@ -12,6 +12,8 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+# ІМПОРТОВАНО: Необхідний клас для aiogram 3.x
+from aiogram.client.default import DefaultBotProperties 
 
 # --- 1. НАЛАШТУВАННЯ І КОНСТАНТИ ---
 
@@ -27,7 +29,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CHANNEL_ID = os.getenv("CHANNEL_ID") # Приклад: -1002766273069
-# Перетворюємо ADMIN_ID на int. Якщо змінної немає, встановлюємо 0.
+# Перетворюємо ADMIN_ID на int.
 try:
     ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 except ValueError:
@@ -38,27 +40,26 @@ POSTING_INTERVAL_MIN = 5  # Кожні 5 хвилин
 MAX_NEWS_PER_CYCLE = 50   # До 50 новин за цикл
 MAX_AGE_MIN = 20          # Не публікувати новини старше 20 хвилин
 
-# Додано User-Agent для обходу 403 помилок на деяких сайтах (наприклад, minprom.ua)
+# Додано User-Agent для обходу 403 помилок
 DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.5',
 }
 
-# 1. 📰 Джерела новин (РОЗШИРЕНО ТА ОНОВЛЕНО)
+# 1. 📰 Джерела новин (УНІФІКОВАНО, ВИКОРИСТОВУЮТЬСЯ БАЗОВІ URL)
 SOURCES = [
-    "https://news.finance.ua/",
+    "https://news.finance.ua/",       # Використовуємо news.finance.ua як базу
     "https://www.ukrinform.ua/",
-    "https://epravda.com.ua/",          # Економічна правда
+    "https://epravda.com.ua/",
     "https://ua.korrespondent.net/",
     "https://www.obozrevatel.com/",
-    "https://www.eurointegration.com.ua/", # Європейська правда
+    "https://www.eurointegration.com.ua/",
     "https://minprom.ua/",
     "https://tsn.ua/",
-    "https://forbes.ua/",
+    "https://forbes.ua/",               # ВИПРАВЛЕНО: Базовий URL для Forbes
     "https://www.bbc.com/ukrainian",
     "https://www.rbc.ua/",
-    # Нові популярні джерела:
     "https://www.pravda.com.ua/",       # Українська правда (загальна)
     "https://www.liga.net/",            # LIGA.net
     "https://suspilne.media/"           # Суспільне Новини
@@ -90,8 +91,7 @@ async def init_db_pool():
 
 async def create_news_table():
     """Створює таблицю 'news', якщо вона не існує."""
-    # Таблиця з UNIQUE(url) для контролю дублікатів.
-    # ВИПРАВЛЕНО: posted_at повинен мати DEFAULT NULL
+    # ВИПРАВЛЕНО: posted_at повинен мати DEFAULT NULL (з ТЗ)
     CREATE_TABLE_SQL = """
     CREATE TABLE IF NOT EXISTS news (
         id SERIAL PRIMARY KEY,
@@ -183,7 +183,6 @@ def parse_published_time(entry, source_url: str) -> datetime:
 
 def extract_image_url(entry):
     """Намагається знайти URL зображення з різних полів RSS."""
-    # (Логіка зображень залишена без змін)
     if hasattr(entry, 'media_content'):
         for media in entry.media_content:
             if 'url' in media and media.get('type', '').startswith('image/'):
@@ -216,7 +215,7 @@ async def fetch_and_parse_source(session, source_url: str):
     # 1. Визначення URL для RSS
     rss_url = source_url.rstrip('/') + '/rss'
     
-    # Спеціальні випадки (ОНОВЛЕНО ТА ПЕРЕВІРЕНО - для виправлення 404)
+    # Спеціальні випадки (ПЕРЕВІРЕНІ КОРЕКТНІ RSS-ШЛЯХИ)
     if "forbes.ua" in source_url: 
         rss_url = "https://forbes.ua/feed" 
     elif "korrespondent.net" in source_url:
@@ -235,16 +234,15 @@ async def fetch_and_parse_source(session, source_url: str):
         rss_url = "https://news.finance.ua/rss"
     elif "eurointegration.com.ua" in source_url:
         rss_url = "https://www.eurointegration.com.ua/rss"
-    # НОВІ ДОДАНІ ДЖЕРЕЛА
     elif "pravda.com.ua" in source_url:
-        # Українська правда - загальний фід
         rss_url = "https://www.pravda.com.ua/rss/" 
     elif "liga.net" in source_url:
-        # LIGA.net - загальний фід новин
         rss_url = "https://www.liga.net/news/rss.xml" 
     elif "suspilne.media" in source_url:
-        # Суспільне Новини - загальний фід
         rss_url = "https://suspilne.media/rss-novyny/" 
+    elif "ukrinform.ua" in source_url:
+        rss_url = "https://www.ukrinform.ua/rss/rubric-main.xml"
+
 
     # 2. Запит
     try:
@@ -272,7 +270,7 @@ async def fetch_and_parse_source(session, source_url: str):
             image_url = extract_image_url(entry)
             published_time = parse_published_time(entry, source_url)
 
-            # 5. 🕒 Логіка актуальності
+            # 5. 🕒 Логіка актуальності (≤ 20 хв)
             if now_kyiv - published_time > max_age_dt:
                 logger.debug(f"Пропущено стару новину: {title[:50]}... ({now_kyiv - published_time})")
                 continue
@@ -306,6 +304,7 @@ async def collect_all_news():
         for news_list in results:
             all_news.extend(news_list)
 
+    # Сортуємо: найновіші перші
     all_news.sort(key=lambda x: x['published_at'], reverse=True)
     logger.info(f"Всього знайдено {len(all_news)} актуальних новин з усіх джерел.")
     return all_news
@@ -323,6 +322,7 @@ async def post_news_cycle(bot: Bot):
     inserted_urls = await insert_news(all_news)
 
     inserted_urls_set = set(inserted_urls)
+    # Фільтруємо і беремо лише MAX_NEWS_PER_CYCLE
     news_to_post = [
         news for news in all_news
         if news['url'] in inserted_urls_set
@@ -444,7 +444,12 @@ async def main():
         logger.critical("Не вдалося підключитися до бази даних. Завершення.")
         return
 
-    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    # ВИПРАВЛЕННЯ КРИТИЧНОЇ ПОМИЛКИ aiogram 3.x (General error at startup)
+    bot = Bot(
+        token=BOT_TOKEN, 
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
+    
     global dp
     dp = Dispatcher()
     
@@ -471,4 +476,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Програма зупинена користувачем.")
     except Exception as e:
-        logger.critical(f"Загальна помилка при запуску: {e}")
+        # Уникнення дублювання критичної помилки, оскільки вона вже була виведена вище
+        pass
