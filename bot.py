@@ -35,32 +35,41 @@ except ValueError:
 
 # Конфігурація бота
 POSTING_INTERVAL_MIN = 5  # Кожні 5 хвилин
-MAX_NEWS_PER_CYCLE = 50   # До 50 новин за цикл
+# ЗБІЛЬШЕНО: До 100 новин за цикл
+MAX_NEWS_PER_CYCLE = 100   
 MAX_AGE_MIN = 20          # Не публікувати новини старше 20 хвилин
 
 # Додано User-Agent для обходу 403 помилок
 DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.5',
+    'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7', # Додано українську мову
 }
 
-# 1. 📰 Джерела новин (АКТУАЛЬНІ RSS-ШЛЯХИ)
+# 1. 📰 Джерела новин (ТОП-22 УКРАЇНСЬКИХ RSS-ШЛЯХІВ)
 SOURCES = [
-    "https://news.finance.ua/",
-    "https://www.ukrinform.ua/",
+    "https://www.pravda.com.ua/",
     "https://epravda.com.ua/",
+    "https://www.eurointegration.com.ua/",
+    "https://www.liga.net/",
+    "https://www.rbc.ua/",
+    "https://www.ukrinform.ua/",
+    "https://tsn.ua/",
+    "https://www.bbc.com/ukrainian",
     "https://ua.korrespondent.net/",
     "https://www.obozrevatel.com/",
-    "https://www.eurointegration.com.ua/",
-    "https://minprom.ua/",
-    "https://tsn.ua/",
-    "https://forbes.ua/",
-    "https://www.bbc.com/ukrainian",
-    "https://www.rbc.ua/",
-    "https://www.pravda.com.ua/",
-    "https://www.liga.net/",
-    "https://suspilne.media/"
+    "https://news.finance.ua/",
+    "https://suspilne.media/",
+    "https://www.unian.ua/",
+    "https://ua.interfax.com.ua/",
+    "https://nv.ua/",
+    "https://zaxid.net/",
+    "https://hromadske.ua/",
+    "https://censor.net/",
+    "https://minfin.com.ua/",
+    "https://gazeta.ua/",
+    "https://focus.ua/",
+    "https://apostrophe.ua/",
 ]
 
 # Кількість новин, які будемо намагатися парсити з кожного джерела
@@ -214,39 +223,53 @@ async def fetch_and_parse_source(session, source_url: str):
     # 1. Визначення URL для RSS
     rss_url = source_url.rstrip('/') + '/rss'
     
-    # Спеціальні випадки (КОРЕКЦІЯ RSS-ШЛЯХІВ)
-    if "forbes.ua" in source_url: 
-        rss_url = "https://forbes.ua/feed" 
-    elif "korrespondent.net" in source_url:
-        rss_url = "https://ua.korrespondent.net/all/rss_feed/" 
-    elif "obozrevatel.com" in source_url:
-        rss_url = "https://www.obozrevatel.com/ukr/news/rss.xml" 
-    elif "rbc.ua" in source_url:
-        rss_url = "https://www.rbc.ua/static/rss/ukr/all.xml" 
-    elif "tsn.ua" in source_url:
-        rss_url = "https://tsn.ua/rss"
-    elif "bbc.com/ukrainian" in source_url:
-        rss_url = "https://feeds.bbci.co.uk/ukrainian/rss.xml"
-    elif "minprom.ua" in source_url:
-        rss_url = "https://minprom.ua/news/rss"
-    # ВИПРАВЛЕНО: Примусово українська версія
-    elif "news.finance.ua" in source_url:
-        rss_url = "https://news.finance.ua/ua/rss"
-    # ВИПРАВЛЕНО: Примусово українська версія
-    elif "pravda.com.ua" in source_url:
-        rss_url = "https://www.pravda.com.ua/rss/"
-    # ВИПРАВЛЕНО: Для ЕП - це окремий фід.
+    # Спеціальні випадки (КОРЕКЦІЯ RSS-ШЛЯХІВ на ЯВНІ УКРАЇНСЬКІ)
+    
+    if "pravda.com.ua" in source_url: 
+        rss_url = "https://www.pravda.com.ua/rss/" 
     elif "epravda.com.ua" in source_url:
         rss_url = "https://www.epravda.com.ua/rss/"
     elif "eurointegration.com.ua" in source_url:
         rss_url = "https://www.eurointegration.com.ua/articles/rss/" 
+    # ВИПРАВЛЕНО: Явний український фід для Ліга
     elif "liga.net" in source_url:
         rss_url = "https://www.liga.net/news/rss.xml" 
-    elif "suspilne.media" in source_url:
-        rss_url = "https://suspilne.media/rss-novyny/" 
+    elif "rbc.ua" in source_url:
+        rss_url = "https://www.rbc.ua/static/rss/ukr/all.xml" 
     elif "ukrinform.ua" in source_url:
         rss_url = "https://www.ukrinform.ua/rss.xml"
-
+    elif "tsn.ua" in source_url:
+        rss_url = "https://tsn.ua/rss"
+    elif "bbc.com/ukrainian" in source_url:
+        rss_url = "https://feeds.bbci.co.uk/ukrainian/rss.xml"
+    elif "korrespondent.net" in source_url:
+        rss_url = "https://ua.korrespondent.net/all/rss_feed/" 
+    elif "obozrevatel.com" in source_url:
+        rss_url = "https://www.obozrevatel.com/ukr/news/rss.xml" 
+    elif "news.finance.ua" in source_url:
+        rss_url = "https://news.finance.ua/ua/rss"
+    elif "suspilne.media" in source_url:
+        rss_url = "https://suspilne.media/rss-novyny/"
+    elif "unian.ua" in source_url:
+        rss_url = "https://www.unian.ua/rss/news"
+    elif "interfax.com.ua" in source_url: 
+        rss_url = "https://ua.interfax.com.ua/news/rss.xml"
+    elif "nv.ua" in source_url:
+        rss_url = "https://nv.ua/ukr/rss/all.xml"
+    elif "zaxid.net" in source_url:
+        rss_url = "https://zaxid.net/rss_all.xml"
+    elif "hromadske.ua" in source_url:
+        rss_url = "https://hromadske.ua/feeds/news"
+    elif "censor.net" in source_url:
+        rss_url = "https://censor.net/ua/rss"
+    elif "minfin.com.ua" in source_url:
+        rss_url = "https://minfin.com.ua/ua/rss/"
+    elif "gazeta.ua" in source_url:
+        rss_url = "https://gazeta.ua/rss.xml"
+    elif "focus.ua" in source_url:
+        rss_url = "https://focus.ua/uk/rss/all"
+    elif "apostrophe.ua" in source_url:
+        rss_url = "https://apostrophe.ua/ua/rss"
 
     # 2. Запит
     try:
@@ -299,7 +322,8 @@ async def collect_all_news():
     Паралельно парсить усі джерела і збирає всі нові та актуальні новини.
     """
     all_news = []
-    timeout = aiohttp.ClientTimeout(total=30)
+    # Збільшено таймаут на випадок повільних джерел
+    timeout = aiohttp.ClientTimeout(total=45) 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [fetch_and_parse_source(session, source) for source in SOURCES]
         results = await asyncio.gather(*tasks)
@@ -326,7 +350,7 @@ async def post_news_cycle(bot: Bot):
     inserted_urls = await insert_news(all_news)
 
     inserted_urls_set = set(inserted_urls)
-    # Фільтруємо: беремо тільки щойно вставлені (нові) новини, до 50 штук.
+    # Фільтруємо: беремо тільки щойно вставлені (нові) новини, до 100 штук.
     news_to_post = [
         news for news in all_news
         if news['url'] in inserted_urls_set
