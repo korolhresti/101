@@ -12,7 +12,6 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-# НОВИЙ ІМПОРТ: Потрібен для налаштування DefaultBotProperties
 from aiogram.client.default import DefaultBotProperties 
 
 # --- 1. НАЛАШТУВАННЯ І КОНСТАНТИ ---
@@ -47,7 +46,7 @@ DEFAULT_HEADERS = {
     'Accept-Language': 'en-US,en;q=0.5',
 }
 
-# 1. 📰 Джерела новин (Оновлено)
+# 1. 📰 Джерела новин
 SOURCES = [
     "https://news.finance.ua/",
     "https://www.ukrinform.ua/",
@@ -58,7 +57,7 @@ SOURCES = [
     "https://minprom.ua/",
     "https://forbes.ua/news",
     "https://nv.ua/ukr/allnews.html",
-    "https://www.rbc.ua/rus/news" # Додано РБК-Україна
+    "https://www.rbc.ua/rus/news"
 ]
 
 # Кількість новин, які будемо намагатися парсити з кожного джерела
@@ -226,21 +225,30 @@ async def fetch_and_parse_source(session, source_url: str):
     # 1. Визначення URL для RSS (налаштування для деяких джерел)
     rss_url = source_url.rstrip('/') + '/rss'
     
-    # Спеціальні випадки (враховуємо нові адреси)
+    # Спеціальні випадки (ОНОВЛЕНО)
     if "forbes.ua" in source_url: 
-        rss_url = "https://forbes.ua/rss"
+        # Forbes.ua
+        rss_url = "https://forbes.ua/feed/rss" 
     elif "korrespondent.net" in source_url:
-        # Загальний RSS для Кореспондент
+        # Korrespondent - загальний RSS (підійде для будь-якої категорії)
         rss_url = "https://ua.korrespondent.net/rss" 
     elif "nv.ua" in source_url:
-        # RSS для НВ
-        rss_url = "https://nv.ua/ukr/rss.xml" 
+        # NV - загальні новини
+        rss_url = "https://nv.ua/ukr/rss/all.xml" 
     elif "finance.ua" in source_url:
-        # RSS для новин finance.ua
         rss_url = "https://news.finance.ua/rss"
     elif "rbc.ua" in source_url:
-        # RSS для РБК-Україна
-        rss_url = "https://www.rbc.ua/static/rss/news.xml" 
+        # RBC-Україна - всі новини
+        rss_url = "https://www.rbc.ua/static/rss/all.xml" 
+    elif "obozrevatel.com" in source_url:
+        # Obozrevatel - загальні новини
+        rss_url = "https://www.obozrevatel.com/feed"
+    elif "minprom.ua" in source_url:
+        # Minprom.ua - новини 
+        rss_url = "https://minprom.ua/news/rss"
+    elif "eurointegration.com.ua" in source_url:
+        # Eurointegration
+        rss_url = "https://www.eurointegration.com.ua/rss"
         
     # 2. Запит
     try:
