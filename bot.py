@@ -60,7 +60,6 @@ SOURCES = [
 ]
 
 # Кількість новин, які будемо намагатися парсити з кожного джерела
-# для обробки ліміту в 50 і перевірки актуальності 20хв
 FETCH_LIMIT = 15
 
 # Глобальний пул підключень до бази даних
@@ -129,7 +128,6 @@ async def insert_news(news_list):
                 # Конвертуємо published_at у python datetime з timezone
                 published_at = news_item.get('published_at')
                 # Якщо час не знайдено, використовуємо час, що гарантує, що новина буде проігнорована
-                # у фільтрі актуальності, але вставиться в базу для контролю дублікатів.
                 if not isinstance(published_at, datetime):
                     published_at = datetime.now(KYIV_TZ) - timedelta(minutes=MAX_AGE_MIN + 1)
 
@@ -184,7 +182,6 @@ def parse_published_time(entry, source_url: str) -> datetime:
         logger.warning(f"Помилка парсингу часу для {source_url}: {e}. Використано час UTC-0.")
 
     # Якщо час не знайдено, повертаємо час, що гарантує, що новина буде проігнорована
-    # у фільтрі актуальності, але дозволить вставити її для контролю дублікатів URL.
     return datetime.now(KYIV_TZ) - timedelta(minutes=MAX_AGE_MIN + 1)
 
 def extract_image_url(entry):
@@ -225,6 +222,7 @@ async def fetch_and_parse_source(session, source_url: str):
     logger.info(f"Парсинг: {source_url}")
 
     # 1. Визначення URL для RSS (налаштування для деяких джерел)
+    # Стандартний варіант
     rss_url = source_url.rstrip('/') + '/rss'
     
     # Спеціальні випадки (враховуємо нові адреси)
@@ -323,8 +321,6 @@ async def post_news_cycle(bot: Bot):
     all_news = await collect_all_news()
 
     # 2. Відбір нових новин (зберігання в базу з унікальною URL)
-    # Зберігаємо всі знайдені новини, які пройшли фільтр актуальності.
-    # 'inserted_urls' містить лише URL, які були ВСТАВЛЕНІ (тобто нові, не дублікати)
     inserted_urls = await insert_news(all_news)
 
     # 3. Фільтруємо список новин, щоб постити лише ті, що були щойно вставлені
@@ -367,7 +363,6 @@ async def post_news_cycle(bot: Bot):
             # Якщо постингу не відбулося, не оновлюємо posted_at
 
     # 5. Оновлення posted_at для успішно опублікованих новин
-    # Це гарантує, що posted_at відображає фактичний час публікації в Telegram
     await update_posted_at(urls_posted_successfully)
 
 
@@ -379,8 +374,6 @@ async def post_news_cycle(bot: Bot):
 # --- 5. КОМАНДИ АДМІНІСТРАТОРА (aiogram) ---
 
 # /status
-@Command("status")
-@F.from_user.id.in_({ADMIN_ID}) # Обмежуємо доступ лише для ADMIN_ID
 async def cmd_status(message: types.Message):
     """Показує статистику бота."""
     total_news = 0
@@ -389,7 +382,7 @@ async def cmd_status(message: types.Message):
         if db_pool:
             async with db_pool.acquire() as conn:
                 total_news = await conn.fetchval("SELECT COUNT(*) FROM news")
-                # Знаходимо час останнього успішного постингу (де posted_at не NULL, якщо була змінена схема)
+                # Знаходимо час останнього успішного постингу
                 last_posted_dt = await conn.fetchval("SELECT MAX(posted_at) FROM news")
                 if last_posted_dt:
                     # Приводимо час до Київського для відображення
@@ -411,8 +404,6 @@ async def cmd_status(message: types.Message):
     await message.answer(status_message, parse_mode=ParseMode.MARKDOWN)
 
 # /forcepost
-@Command("forcepost")
-@F.from_user.id.in_({ADMIN_ID})
 async def cmd_forcepost(message: types.Message, bot: Bot):
     """Запускає позачергову перевірку і постинг новин."""
     await message.answer("🔄 Запускаю позачерговий цикл парсингу та постингу...")
@@ -420,8 +411,6 @@ async def cmd_forcepost(message: types.Message, bot: Bot):
     await message.answer("✅ Позачерговий цикл завершено.")
 
 # /stats
-@Command("stats")
-@F.from_user.id.in_({ADMIN_ID})
 async def cmd_stats(message: types.Message):
     """Показує кількість опублікованих новин за добу."""
     news_24h = 0
@@ -475,7 +464,8 @@ async def main():
     global dp
     dp = Dispatcher()
     
-    # Реєстрація команд адміністратора
+    # Реєстрація команд адміністратора (ВИПРАВЛЕНО: використання F-фільтрів та Command)
+    # Зверніть увагу, що тут ми використовуємо F.from_user.id == ADMIN_ID для фільтрації адміністратора
     dp.message.register(cmd_status, Command("status"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_forcepost, Command("forcepost"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_stats, Command("stats"), F.from_user.id == ADMIN_ID)
@@ -486,7 +476,7 @@ async def main():
     logger.info("Бот запущено. Початок роботи.")
 
     try:
-        # Запускаємо polling (оскільки Render добре підходить для постійних процесів)
+        # Запускаємо polling
         await dp.start_polling(bot)
     finally:
         # Закриття ресурсів
