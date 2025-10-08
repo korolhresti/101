@@ -61,53 +61,7 @@ SOURCES = [
     "https://ua.korrespondent.net/rss/all",
     "https://apostrophe.ua/rss/all.xml",
     "https://www.liga.net/rss/news.xml",
-    "https://gazeta.ua/rss/all",
-    "https://24tv.ua/rss/all.xml",
-    "https://nv.ua/rss/all.xml",
-    "https://delo.ua/rss/all.xml",
-    "https://suspilne.media/feed/",
-    "https://uain.press/rss",
-    "https://www.segodnya.ua/rss/news.xml",
-    "https://www.bbc.com/ukrainian/rss.xml"
-]
-
-# Ліміти
-FETCH_LIMIT = 100
-
-# 2️⃣ Заголовки для сайтів, що блокують ботів
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) "
-                  "Chrome/139.0.0.0 Safari/537.36"
-}
-
-# 3️⃣ Завантаження RSS з обробкою помилок
-async def fetch_rss(session, url):
-    try:
-        async with session.get(url, headers=HEADERS, timeout=10) as resp:
-            if resp.status == 200:
-                text = await resp.text()
-                feed = feedparser.parse(text)
-                return feed
-            else:
-                logger.warning(f"Помилка {resp.status} при отриманні RSS для {url}")
-                return None
-    except Exception as e:
-        logger.error(f"AIOHTTP помилка для {url}: {e}")
-        return None
-
-# 4️⃣ Приклад асинхронного завантаження всіх джерел
-async def fetch_all_sources():
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_rss(session, url) for url in SOURCES]
-        results = await asyncio.gather(*tasks)
-        return [feed for feed in results if feed is not None]
-
-# ===== Тест =====
-if __name__ == "__main__":
-    feeds = asyncio.run(fetch_all_sources())
-    logger.info(f"Успішно отримано {len(feeds)} RSS з усіх джерел.")
-
+import asyncio import logging from datetime import datetime, timedelta, timezone from urllib.parse import urlparse import asyncpg import aiohttp import feedparser from bs4 import BeautifulSoup from aiogram import Bot, Dispatcher, types, F from aiogram.enums import ParseMode from aiogram.filters import Command from aiogram.client.default import DefaultBotProperties # --- 1. НАЛАШТУВАННЯ І КОНСТАНТИ --- # Використовуйте Kyiv time zone (UTC+3) KYIV_TZ = timezone(timedelta(hours=3), 'Europe/Kyiv') # Налаштування логування logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s') logger = logging.getLogger(__name__) # Змінні середовища (читаються з Render Environment) BOT_TOKEN = os.getenv("BOT_TOKEN") DATABASE_URL = os.getenv("DATABASE_URL") CHANNEL_ID = os.getenv("CHANNEL_ID") # Приклад: -1002766273069 try: ADMIN_ID = int(os.getenv("ADMIN_ID", 0)) except ValueError: ADMIN_ID = 0 # Конфігурація бота POSTING_INTERVAL_MIN = 5 # Кожні 5 хвилин # До 100 новин за цикл MAX_NEWS_PER_CYCLE = 100 MAX_AGE_MIN = 20 # Не публікувати новини старше 20 хвилин # Додано User-Agent для обходу 403 помилок DEFAULT_HEADERS = { # ВИПРАВЛЕНО: Більш надійний User-Agent, що імітує Chrome 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8', 'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7', } # 1. 📰 Джерела новин (ТОП-21 УКРАЇНСЬКИХ RSS-ШЛЯХІВ, ФІНАЛЬНА ОПТИМІЗАЦІЯ) SOURCES = [ "https://epravda.com.ua/", "https://news.liga.net/ua/", "https://www.eurointegration.com.ua/", "https://www.rbc.ua/", "https://www.ukrinform.ua/", "https://tsn.ua/", "http://feeds.bbci.co.uk/ukrainian/rss.xml", "https://ua.korrespondent.net/", "https://www.obozrevatel.com/", "https://news.finance.ua/", "https://suspilne.media/", "https://www.unian.ua/", "https://ua.interfax.com.ua/", "https://nv.ua/", "https://zaxid.net/", "https://hromadske.ua/", "https://censor.net/", "https://minfin.com.ua/", "https://gazeta.ua/", "https://focus.ua/", "https://apostrophe.ua/", ] # Кількість новин, які будемо намагатися парсити з кожного джерела FETCH_LIMIT = 15
 # Глобальний пул підключень до бази даних
 db_pool = None
 # Диспетчер для aiogram
