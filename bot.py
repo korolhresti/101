@@ -90,7 +90,7 @@ async def create_news_table():
         summary TEXT,
         image_url TEXT,
         published_at TIMESTAMP WITH TIME ZONE,
-        posted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        posted_at TIMESTAMP WITH TIME ZONE
     );
     """
     if db_pool:
@@ -122,7 +122,7 @@ async def insert_news(news_list):
                 # Конвертуємо published_at у python datetime з timezone
                 published_at = news_item.get('published_at')
                 # Якщо час не знайдено, використовуємо час, що гарантує, що новина буде проігнорована
-                # у фільтрі актуальності, але вставиться в базу для контролю дублікатів.
+                # у фільтрі актуальності, але вставиться в базу для контролю дублікатів
                 if not isinstance(published_at, datetime):
                     published_at = datetime.now(KYIV_TZ) - timedelta(minutes=MAX_AGE_MIN + 1)
 
@@ -154,7 +154,10 @@ async def update_posted_at(urls_list):
     WHERE url = ANY($1::TEXT[]);
     """
     async with db_pool.acquire() as conn:
-        return await conn.execute(UPDATE_SQL, urls_list)
+        # повертає рядок 'UPDATE X', де X - кількість оновлених рядків
+        result = await conn.execute(UPDATE_SQL, urls_list)
+        # Витягуємо кількість оновлених рядків
+        return int(result.split()[-1])
 
 
 # --- 3. ПАРСИНГ НОВИН ---
@@ -320,7 +323,10 @@ async def post_news_cycle(bot: Bot):
 
     for news in news_to_post:
         # 4. Формування та публікація повідомлення
-        text = f"📰 <b>{news['title']}</b>\n\n{news['summary']}\n\n🔗 Джерело: {news['url']}"
+        # Видаляємо зайві пробіли та символи нового рядка в заголовку перед форматуванням
+        clean_title = news['title'].strip().replace('\n', ' ')
+        
+        text = f"📰 <b>{clean_title}</b>\n\n{news['summary']}\n\n🔗 Джерело: {news['url']}"
 
         try:
             if news['image_url']:
@@ -347,9 +353,7 @@ async def post_news_cycle(bot: Bot):
             # Якщо постингу не відбулося, не оновлюємо posted_at
 
     # 5. Оновлення posted_at для успішно опублікованих новин
-    # Це гарантує, що posted_at відображає фактичний час публікації в Telegram
     await update_posted_at(urls_posted_successfully)
-
 
     end_time = datetime.now()
     duration = (end_time - start_time).total_seconds()
@@ -367,8 +371,8 @@ async def cmd_status(message: types.Message):
         if db_pool:
             async with db_pool.acquire() as conn:
                 total_news = await conn.fetchval("SELECT COUNT(*) FROM news")
-                # Знаходимо час останнього успішного постингу (де posted_at не NULL, якщо була змінена схема)
-                last_posted_dt = await conn.fetchval("SELECT MAX(posted_at) FROM news")
+                # Знаходимо час останнього успішного постингу
+                last_posted_dt = await conn.fetchval("SELECT MAX(posted_at) FROM news WHERE posted_at IS NOT NULL")
                 if last_posted_dt:
                     # Приводимо час до Київського для відображення
                     last_posted = last_posted_dt.astimezone(KYIV_TZ).strftime("%d.%m.%Y %H:%M:%S")
@@ -449,9 +453,9 @@ async def main():
     global dp
     dp = Dispatcher()
     
-    # Реєстрація команд адміністратора (це правильно і тепер працюватиме)
+    # Реєстрація команд адміністратора
     dp.message.register(cmd_status, Command("status"), F.from_user.id == ADMIN_ID)
-    dp.message.register(cmd_forcepost, Command("forcepost"), F.from_user.id == ADMIN_ID)
+    dp.message.register(cmd_forcepost, Command("forcepost"), F.from_user.id == ADMIN_ID, F.text.lower() == "/forcepost") # Додаємо фільтр тексту
     dp.message.register(cmd_stats, Command("stats"), F.from_user.id == ADMIN_ID)
 
     # Запуск безкінечного циклу автопостингу
@@ -476,4 +480,3 @@ if __name__ == "__main__":
         logger.info("Програма зупинена користувачем.")
     except Exception as e:
         logger.critical(f"Загальна помилка при запуску: {e}")
-}
