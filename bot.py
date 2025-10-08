@@ -12,6 +12,8 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+# Новий імпорт для сучасної ініціалізації бота
+from aiogram.client.default import DefaultBotProperties
 
 # --- 1. НАЛАШТУВАННЯ І КОНСТАНТИ ---
 
@@ -53,7 +55,6 @@ SOURCES = [
 ]
 
 # Кількість новин, які будемо намагатися парсити з кожного джерела
-# для обробки ліміту в 50 і перевірки актуальності 20хв
 FETCH_LIMIT = 15
 
 # Глобальний пул підключень до бази даних
@@ -448,14 +449,16 @@ async def main():
         logger.critical("Не вдалося підключитися до бази даних. Завершення.")
         return
 
-    # Ініціалізація Telegram
-    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    # Ініціалізація Telegram (ОНОВЛЕНО!)
+    default_props = DefaultBotProperties(parse_mode=ParseMode.HTML)
+    bot = Bot(token=BOT_TOKEN, default=default_props)
+
     global dp
     dp = Dispatcher()
     
     # Реєстрація команд адміністратора
     dp.message.register(cmd_status, Command("status"), F.from_user.id == ADMIN_ID)
-    dp.message.register(cmd_forcepost, Command("forcepost"), F.from_user.id == ADMIN_ID, F.text.lower() == "/forcepost") # Додаємо фільтр тексту
+    dp.message.register(cmd_forcepost, Command("forcepost"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_stats, Command("stats"), F.from_user.id == ADMIN_ID)
 
     # Запуск безкінечного циклу автопостингу
