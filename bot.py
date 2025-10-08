@@ -51,7 +51,7 @@ SOURCES = [
     "https://minprom.ua/",
     "https://tsn.ua/",
     "https://forbes.ua/news",
-    "https://www.bbc.com/ukrainian"
+    "https://www.bbc.com/ukrainian" # Виправлено URL для RSS у fetch_and_parse_source
 ]
 
 # Кількість новин, які будемо намагатися парсити з кожного джерела
@@ -84,12 +84,12 @@ async def create_news_table():
     Створює таблицю 'news', якщо вона не існує.
     Видаляє залежну таблицю 'moderation_logs', щоб уникнути помилки залежності.
     """
-    # 1. Видалення залежної таблиці (яка спричинила помилку)
+    # 1. Видалення залежної таблиці (з логів видно, що це потрібно)
     DROP_DEPENDENCY_SQL = """
     DROP TABLE IF EXISTS moderation_logs;
     """
     
-    # 2. Створення основної таблиці
+    # 2. Створення основної таблиці (posted_at має бути DEFAULT NULL)
     CREATE_TABLE_SQL = """
     CREATE TABLE IF NOT EXISTS news (
         id SERIAL PRIMARY KEY,
@@ -99,7 +99,7 @@ async def create_news_table():
         summary TEXT,
         image_url TEXT,
         published_at TIMESTAMP WITH TIME ZONE,
-        posted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL
+        posted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL 
     );
     """
     if db_pool:
@@ -224,6 +224,9 @@ async def fetch_and_parse_source(session, source_url: str):
         rss_url = "https://forbes.ua/rss"
     elif source_url.startswith("https://ua.korrespondent.net/"):
         rss_url = "https://ua.korrespondent.net/rss"
+    # ВИПРАВЛЕННЯ: Для BBC використовуємо повний шлях до RSS
+    elif source_url == "https://www.bbc.com/ukrainian":
+        rss_url = "https://www.bbc.com/ukrainian/rss.xml" 
 
     # 2. Запит
     try:
@@ -275,6 +278,7 @@ async def collect_all_news():
     Паралельно парсить усі джерела і збирає всі нові та актуальні новини.
     """
     all_news = []
+    # Створюємо асинхронну сесію з лімітом для паралельних запитів
     connector = aiohttp.TCPConnector(limit=30) 
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [fetch_and_parse_source(session, source) for source in SOURCES]
@@ -333,14 +337,14 @@ async def post_news_cycle(bot: Bot):
                     chat_id=CHANNEL_ID,
                     photo=news['image_url'],
                     caption=text,
-                    # parse_mode тепер встановлено за замовчуванням
+                    # parse_mode тепер встановлено за замовчуванням у Bot init
                 )
             else:
                 # Публікація без фото
                 await bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=text,
-                    # parse_mode тепер встановлено за замовчуванням
+                    # parse_mode тепер встановлено за замовчуванням у Bot init
                     disable_web_page_preview=True
                 )
             urls_posted_successfully.append(news['url'])
@@ -442,10 +446,11 @@ async def main():
     # Ініціалізація бази даних
     await init_db_pool()
     if not db_pool:
-        logger.warning("Не вдалося підключитися до бази даних під час старту. Бот спробує відновити з'єднання у циклі.")
+        logger.critical("Не вдалося підключитися до бази даних. Завершення.")
+        return
 
     # Ініціалізація Telegram
-    # ВИПРАВЛЕНО: Використання DefaultBotProperties для parse_mode, як того вимагає aiogram 3.7+
+    # ВИПРАВЛЕНО: Використання DefaultBotProperties для parse_mode (для aiogram 3.7+)
     bot = Bot(
         token=BOT_TOKEN, 
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -464,6 +469,9 @@ async def main():
     logger.info("Бот запущено. Початок роботи.")
 
     try:
+        # ВИПРАВЛЕННЯ КОНФЛІКТУ: Примусово видаляємо Webhook, щоб увімкнути Polling.
+        await bot.delete_webhook(drop_pending_updates=True) 
+        
         # Запускаємо polling
         await dp.start_polling(bot)
     finally:
