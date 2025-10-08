@@ -55,7 +55,7 @@ SOURCES = [
     "https://www.rbc.ua/",
     "https://www.ukrinform.ua/",
     "https://tsn.ua/",
-    "http://feeds.bbci.co.uk/ukrainian/rss.xml", # ВИПРАВЛЕНО: Надійний Feedburner для BBC
+    "http://feeds.bbci.co.uk/ukrainian/rss.xml", 
     "https://ua.korrespondent.net/",
     "https://www.obozrevatel.com/",
     "https://news.finance.ua/",
@@ -228,16 +228,16 @@ async def fetch_and_parse_source(session, source_url: str):
     if "epravda.com.ua" in source_url:
         rss_path = "/rss/"
     elif "eurointegration.com.ua" in source_url:
-        # Виправлено: спрощено до загального шляху
-        rss_path = "/rss.xml" 
+        # ВИПРАВЛЕНО: Змінено на /rss (більш загальний та робочий)
+        rss_path = "/rss" 
     elif "liga.net" in source_url:
-        # ВИПРАВЛЕНО: для https://news.liga.net/ua/ використовуємо загальний шлях
         rss_path = "/rss.xml" 
     elif "rbc.ua" in source_url:
-        # Виправлено: змінено на більш загальний
-        rss_path = "/rss/news" 
+        # ВИПРАВЛЕНО: Спроба україномовної версії
+        rss_path = "/rss/ukr.rss" 
     elif "ukrinform.ua" in source_url:
-        rss_path = "/rss.xml"
+        # ВИПРАВЛЕНО: Використовуємо /rss/latest
+        rss_path = "/rss/latest"
     elif "tsn.ua" in source_url:
         rss_path = "/rss"
     elif "bbci.co.uk" in source_url:
@@ -246,40 +246,44 @@ async def fetch_and_parse_source(session, source_url: str):
         source_domain = "bbc.com/ukrainian" # Спеціальне значення для відображення
         pass 
     elif "korrespondent.net" in source_url:
-        # Виправлено: спрощено до загального
-        rss_path = "/rss/all_news" 
+        # ВИПРАВЛЕНО: Спрощено до загального /rss
+        rss_path = "/rss" 
     elif "obozrevatel.com" in source_url:
-        # Виправлено: спрощено до загального
-        rss_path = "/rss/all.rss" 
+        # ВИПРАВЛЕНО: Спроба надійного шляху для укр. новин
+        rss_path = "/rss/rss_ukr.xml" 
     elif "news.finance.ua" in source_url:
         rss_path = "/ua/rss"
     elif "suspilne.media" in source_url:
-        # ВИПРАВЛЕНО: Спроба надійнішого шляху
-        rss_path = "/feed/all/rss.xml"
+        # ВИПРАВЛЕНО: Спроба /rss/all (обхід 403)
+        rss_path = "/rss/all"
     elif "unian.ua" in source_url:
-        # Виправлено: явний український фід
-        rss_path = "/rss/news/ukr/feed" 
+        # ВИПРАВЛЕНО: Спрощено до /rss/news/ukr
+        rss_path = "/rss/news/ukr" 
     elif "interfax.com.ua" in source_url: 
-        # Виправлено: спрощено до загального
-        rss_path = "/news/rss"
+        # ВИПРАВЛЕНО: Спроба більш явного шляху
+        rss_path = "/news/ukraine.xml"
     elif "nv.ua" in source_url:
         rss_path = "/ukr/rss/all.xml"
     elif "zaxid.net" in source_url:
         rss_path = "/rss"
     elif "hromadske.ua" in source_url:
-        rss_path = "/rss/all"
+        # ВИПРАВЛЕНО: Спроба /feeds/all.rss
+        rss_path = "/feeds/all.rss"
     elif "censor.net" in source_url:
-        # Виправлено: змінено на робочий шлях
-        rss_path = "/ua/news/rss"
+        # ВИПРАВЛЕНО: Спроба /news/rss.xml (обхід 403)
+        rss_path = "/news/rss.xml"
     elif "minfin.com.ua" in source_url:
-        rss_path = "/rss"
+        # ВИПРАВЛЕНО: /rss/news
+        rss_path = "/rss/news"
     elif "gazeta.ua" in source_url:
-        rss_path = "/rss.xml"
+        # ВИПРАВЛЕНО: /rss/ukr.rss
+        rss_path = "/rss/ukr.rss"
     elif "focus.ua" in source_url:
-        rss_path = "/rss"
+        # ВИПРАВЛЕНО: Спроба /rss/feed
+        rss_path = "/rss/feed"
     elif "apostrophe.ua" in source_url:
-        # Виправлено: змінено на робочий шлях
-        rss_path = "/rss/feed.xml"
+        # ВИПРАВЛЕНО: Спроба /rss.xml
+        rss_path = "/rss.xml"
     
     # Якщо це не BBC, формуємо URL зі шляху
     if "bbci.co.uk" not in source_url:
