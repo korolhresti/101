@@ -57,29 +57,29 @@ DEFAULT_HEADERS = {
 
 # 1. 📰 Джерела новин (ФІНАЛЬНА ОПТИМІЗАЦІЯ)
 SOURCES = [
-    "https://epravda.com.ua/",
-    "https://news.liga.net/ua/",
-    "https://www.eurointegration.com.ua/",
-    "https://www.rbc.ua/",
-    "https://www.ukrinform.ua/",
-    "https://tsn.ua/",
-    "http://feeds.bbci.co.uk/ukrainian/rss.xml", 
-    "https://ua.korrespondent.net/",
-    "https://www.obozrevatel.com/",
-    "https://news.finance.ua/",
-    "https://suspilne.media/",
-    "https://www.unian.ua/",
-    "https://ua.interfax.com.ua/",
-    "https://nv.ua/",
-    "https://zaxid.net/",
-    "https://hromadske.ua/",
-    "https://censor.net/",
-    "https://minfin.com.ua/",
-    "https://gazeta.ua/",
-    "https://focus.ua/",
-    "https://apostrophe.ua/",
+    "https://tsn.ua/rss/all.xml",
+    "https://www.pravda.com.ua/rss/news/",
+    "https://censor.net/rss/all_news",
+    "https://www.bbc.com/ukrainian/index.xml",
+    "https://www.rbc.ua/static/rss/all.xml",
+    "https://www.ukrinform.ua/rss/all.xml",
+    "https://hromadske.ua/feed",
+    "https://www.obozrevatel.com/rss/main.xml",
+    "https://minfin.com.ua/rss/news/",
+    "https://focus.ua/rss/latest.xml",
+    "https://ua.korrespondent.net/rss/all",
+    "https://apostrophe.ua/rss/all.xml",
+    "https://www.liga.net/rss/news.xml",
+    "https://gazeta.ua/rss/all",
+    "https://24tv.ua/rss/all.xml",
+    "https://nv.ua/rss/all.xml",
+    "https://uain.press/rss",
+    "https://suspilne.media/feed/",
+    "https://delo.ua/rss/all.xml",
+    "https://www.segodnya.ua/rss/all.xml"
 ]
-FETCH_LIMIT = 15
+
+FETCH_LIMIT = 30
 
 # Глобальний пул підключень до бази даних
 db_pool = None
