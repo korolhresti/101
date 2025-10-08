@@ -11,7 +11,9 @@ from bs4 import BeautifulSoup
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
-from aiogram.filters import Command # Залишаємо лише для використання як фільтр у dp.message.register
+from aiogram.filters import Command
+# ВИПРАВЛЕННЯ ДЛЯ aiogram 3.7+:
+from aiogram.client.default import DefaultBotProperties # <-- Новий імпорт
 
 # --- 1. НАЛАШТУВАННЯ І КОНСТАНТИ ---
 
@@ -53,7 +55,6 @@ SOURCES = [
 ]
 
 # Кількість новин, які будемо намагатися парсити з кожного джерела
-# для обробки ліміту в 50 і перевірки актуальності 20хв
 FETCH_LIMIT = 15
 
 # Глобальний пул підключень до бази даних
@@ -75,16 +76,13 @@ async def init_db_pool():
         logger.info("Успішно підключено до Neon PostgreSQL.")
         await create_news_table()
     except Exception as e:
-        # Важливо: у разі помилки (наприклад, DB error), пул може бути не None, 
-        # але подальша робота неможлива, якщо create_news_table() не завершилася.
         logger.critical(f"Помилка підключення до БД: {e}")
-        db_pool = None # Забезпечуємо, що пул буде None у разі помилки
+        db_pool = None 
 
 async def create_news_table():
     """
     Створює таблицю 'news', якщо вона не існує.
-    Додано DROP TABLE IF EXISTS moderation_logs для вирішення проблеми залежності,
-    що призвела до помилки "cannot drop table news".
+    Видаляє залежну таблицю 'moderation_logs', щоб уникнути помилки залежності.
     """
     # 1. Видалення залежної таблиці (яка спричинила помилку)
     DROP_DEPENDENCY_SQL = """
@@ -132,13 +130,9 @@ async def insert_news(news_list):
     inserted_urls = []
     
     async with db_pool.acquire() as conn:
-        # Використовуємо транзакцію для пакетного виконання
         async with conn.transaction():
             for news_item in news_list:
-                # Конвертуємо published_at у python datetime з timezone
                 published_at = news_item.get('published_at')
-                # Якщо час не знайдено, використовуємо час, що гарантує, що новина буде проігнорована
-                # у фільтрі актуальності, але вставиться в базу для контролю дублікатів.
                 if not isinstance(published_at, datetime):
                     published_at = datetime.now(KYIV_TZ) - timedelta(minutes=MAX_AGE_MIN + 1)
 
@@ -178,7 +172,6 @@ async def update_posted_at(urls_list):
 def parse_published_time(entry, source_url: str) -> datetime:
     """Намагається отримати та нормалізувати час публікації."""
     try:
-        # Використовуємо .get('published_parsed') або 'updated_parsed'
         parsed_time = None
         if hasattr(entry, 'published_parsed') and entry.published_parsed:
             parsed_time = entry.published_parsed
@@ -186,29 +179,23 @@ def parse_published_time(entry, source_url: str) -> datetime:
             parsed_time = entry.updated_parsed
 
         if parsed_time:
-            # feedparser надає час у UTC
             published_time = datetime(*parsed_time[:6], tzinfo=timezone.utc)
             return published_time.astimezone(KYIV_TZ)
     except Exception as e:
         logger.warning(f"Помилка парсингу часу для {source_url}: {e}. Використано час UTC-0.")
 
-    # Якщо час не знайдено, повертаємо час, що гарантує, що новина буде проігнорована
-    # у фільтрі актуальності, але дозволить вставити її для контролю дублікатів URL.
     return datetime.now(KYIV_TZ) - timedelta(minutes=MAX_AGE_MIN + 1)
 
 def extract_image_url(entry):
     """Намагається знайти URL зображення з різних полів RSS."""
-    # 1. media:content
     if hasattr(entry, 'media_content'):
         for media in entry.media_content:
             if 'url' in media and media.get('type', '').startswith('image/'):
                 return media['url']
-    # 2. enclosures
     if hasattr(entry, 'enclosures'):
         for enclosure in entry.enclosures:
             if enclosure.get('type', '').startswith('image/'):
                 return enclosure['href']
-    # 3. media:thumbnail
     if hasattr(entry, 'media_thumbnail'):
         for thumbnail in entry.media_thumbnail:
             if 'url' in thumbnail:
@@ -220,10 +207,8 @@ def normalize_summary(summary: str) -> str:
     """Очищає та нормалізує текст summary від HTML."""
     if not summary:
         return ""
-    # Видаляємо HTML-теги
     soup = BeautifulSoup(summary, 'html.parser')
     text = soup.get_text().strip()
-    # Обмежуємо довжину
     return text[:700] + ('...' if len(text) > 700 else '')
 
 async def fetch_and_parse_source(session, source_url: str):
@@ -261,7 +246,6 @@ async def fetch_and_parse_source(session, source_url: str):
         try:
             url = entry.link
             title = entry.title
-            # Використовуємо description, якщо summary відсутній
             summary = normalize_summary(entry.summary if hasattr(entry, 'summary') else (entry.description if hasattr(entry, 'description') else entry.title))
             image_url = extract_image_url(entry)
             published_time = parse_published_time(entry, source_url)
@@ -291,12 +275,9 @@ async def collect_all_news():
     Паралельно парсить усі джерела і збирає всі нові та актуальні новини.
     """
     all_news = []
-    # Створюємо асинхронну сесію для ефективного керування підключеннями
-    # Встановлюємо обмеження на кількість одночасних з'єднань
     connector = aiohttp.TCPConnector(limit=30) 
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [fetch_and_parse_source(session, source) for source in SOURCES]
-        # Запускаємо всі парсери одночасно
         results = await asyncio.gather(*tasks)
 
         for news_list in results:
@@ -321,8 +302,6 @@ async def post_news_cycle(bot: Bot):
     all_news = await collect_all_news()
 
     # 2. Відбір нових новин (зберігання в базу з унікальною URL)
-    # Зберігаємо всі знайдені новини, які пройшли фільтр актуальності.
-    # 'inserted_urls' містить лише URL, які були ВСТАВЛЕНІ (тобто нові, не дублікати)
     inserted_urls = await insert_news(all_news)
 
     # 3. Фільтруємо список новин, щоб постити лише ті, що були щойно вставлені
@@ -338,43 +317,37 @@ async def post_news_cycle(bot: Bot):
 
     for news in news_to_post:
         # 4. Формування та публікація повідомлення
-        # Змінено формат на більш компактний для Telegram
         text = (
             f"📰 <b>{news['title']}</b>\n\n"
             f"{news['summary']}\n\n"
             f"<a href='{news['url']}'>🔗 Читати повністю на {news['source']}</a>"
         )
-        # Додаємо час публікації, якщо він доступний і актуальний
         published_time_str = news['published_at'].strftime("%H:%M") if news.get('published_at') else ""
         if published_time_str:
              text += f"\n\n🕒 {published_time_str}"
         
         try:
-            # Telegram Bot API має обмеження на розмір підпису/тексту
             if news['image_url']:
                 # Публікація з фото (якщо є)
                 await bot.send_photo(
                     chat_id=CHANNEL_ID,
                     photo=news['image_url'],
                     caption=text,
-                    parse_mode=ParseMode.HTML
+                    # parse_mode тепер встановлено за замовчуванням
                 )
             else:
                 # Публікація без фото
                 await bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=text,
-                    parse_mode=ParseMode.HTML,
-                    # Вимикаємо попередній перегляд, якщо немає фото (зазвичай краще)
+                    # parse_mode тепер встановлено за замовчуванням
                     disable_web_page_preview=True
                 )
             urls_posted_successfully.append(news['url'])
             posted_count += 1
-            # Затримка між постами, щоб уникнути спаму та лімітів Telegram
             await asyncio.sleep(0.5) 
         except Exception as e:
             logger.error(f"Помилка постингу новини {news['url']}: {e}")
-            # Якщо постингу не відбулося, не оновлюємо posted_at
 
     # 5. Оновлення posted_at для успішно опублікованих новин
     await update_posted_at(urls_posted_successfully)
@@ -386,7 +359,6 @@ async def post_news_cycle(bot: Bot):
 
 
 # --- 5. КОМАНДИ АДМІНІСТРАТОРА (aiogram) ---
-# ВИПРАВЛЕНО: Видалено декоратори @Command та @F.from_user.id.in_
 
 async def cmd_status(message: types.Message):
     """Показує статистику бота."""
@@ -396,10 +368,8 @@ async def cmd_status(message: types.Message):
         if db_pool:
             async with db_pool.acquire() as conn:
                 total_news = await conn.fetchval("SELECT COUNT(*) FROM news")
-                # Знаходимо час останнього успішного постингу (де posted_at не NULL)
                 last_posted_dt = await conn.fetchval("SELECT MAX(posted_at) FROM news WHERE posted_at IS NOT NULL")
                 if last_posted_dt:
-                    # Приводимо час до Київського для відображення
                     last_posted = last_posted_dt.astimezone(KYIV_TZ).strftime("%d.%m.%Y %H:%M:%S")
 
     except Exception as e:
@@ -430,7 +400,6 @@ async def cmd_stats(message: types.Message):
         if db_pool:
             yesterday = datetime.now(KYIV_TZ) - timedelta(hours=24)
             async with db_pool.acquire() as conn:
-                # Рахуємо новини, опубліковані за останні 24 години
                 news_24h = await conn.fetchval(
                     "SELECT COUNT(*) FROM news WHERE posted_at IS NOT NULL AND posted_at >= $1", yesterday
                 )
@@ -448,18 +417,15 @@ async def cmd_stats(message: types.Message):
 
 async def auto_posting_loop(bot: Bot):
     """Безкінечний цикл для автопостингу кожні 5 хвилин."""
-    # Чекаємо 10 секунд після запуску, щоб ініціалізація завершилась
     await asyncio.sleep(10)
     while True:
         try:
-            # Перед запуском основного циклу перевіряємо, чи існує db_pool
             if db_pool:
                 await post_news_cycle(bot)
             else:
                 logger.error("Пул бази даних відсутній. Перезапуск ініціалізації БД.")
-                await init_db_pool() # Спробувати відновити з'єднання
+                await init_db_pool() 
                 if not db_pool:
-                    # Якщо не вдалося відновити, чекаємо і пробуємо знову
                     logger.critical("Не вдалося відновити з'єднання з БД. Очікування.")
         except Exception as e:
             logger.error(f"Критична помилка в циклі автопостингу: {e}")
@@ -476,17 +442,18 @@ async def main():
     # Ініціалізація бази даних
     await init_db_pool()
     if not db_pool:
-        # Не виходимо, а даємо auto_posting_loop шанс відновити з'єднання пізніше
         logger.warning("Не вдалося підключитися до бази даних під час старту. Бот спробує відновити з'єднання у циклі.")
-        # Продовжуємо, щоб хоча б aiogram-частина (команди) запустилася
 
     # Ініціалізація Telegram
-    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    # ВИПРАВЛЕНО: Використання DefaultBotProperties для parse_mode, як того вимагає aiogram 3.7+
+    bot = Bot(
+        token=BOT_TOKEN, 
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    )
     global dp
     dp = Dispatcher()
     
-    # Реєстрація команд адміністратора (Фільтри тепер тільки тут)
-    # Зверніть увагу, що cmd_forcepost має приймати bot, тому його реєструємо інакше
+    # Реєстрація команд адміністратора
     dp.message.register(cmd_status, Command("status"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_forcepost, Command("forcepost"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_stats, Command("stats"), F.from_user.id == ADMIN_ID)
@@ -508,7 +475,6 @@ async def main():
 
 if __name__ == "__main__":
     try:
-        # Рекомендовано використовувати asyncio.run для чистого запуску
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Програма зупинена користувачем.")
