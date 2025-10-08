@@ -66,7 +66,7 @@ SOURCES = [
     "https://delo.ua/rss/all.xml",
     "https://suspilne.media/feed/",
     "https://uain.press/rss",
-    "https://www.segodnya.ua/rss/news.xml",
+    # "https://www.segodnya.ua/rss/news.xml", # Видалено через постійну помилку DNS/блокування
     "https://www.bbc.com/ukrainian/rss.xml",
     "https://www.eurointegration.com.ua/rss/rss.xml", 
     "https://news.finance.ua/ua/rss", 
@@ -95,9 +95,11 @@ async def connect_db():
         # Вихід із програми, якщо не вдалося підключитися
         exit(1)
 
+# ВИПРАВЛЕНО: Додана логіка ALTER TABLE для оновлення структури бази
 async def init_db():
-    """Створює таблицю 'news', якщо вона не існує."""
+    """Створює таблицю 'news', якщо вона не існує, та додає необхідні стовпці."""
     async with db_pool.acquire() as conn:
+        # 1. Створення таблиці, якщо не існує
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS news (
                 id SERIAL PRIMARY KEY,
@@ -107,11 +109,32 @@ async def init_db():
                 summary TEXT,
                 image_url TEXT,
                 published_at TIMESTAMP WITH TIME ZONE NOT NULL,
-                inserted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                is_posted BOOLEAN DEFAULT FALSE
+                inserted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
         """)
-    logger.info("Таблиця 'news' перевірена/створена.")
+        
+        # 2. ❗ МІГРАЦІЯ: Додавання стовпця 'is_posted' для зворотної сумісності/міграції
+        try:
+            await conn.execute("""
+                ALTER TABLE news ADD COLUMN is_posted BOOLEAN DEFAULT FALSE;
+            """)
+            logger.info("Стовпець 'is_posted' успішно додано.")
+        except asyncpg.exceptions.DuplicateColumnError:
+            # Це очікувано, якщо стовпець вже існує
+            pass 
+        except Exception as e:
+            logger.error(f"Помилка при спробі додати стовпець 'is_posted': {e}")
+            
+        # 3. Додавання унікального індексу на url, якщо його ще немає (для ON CONFLICT)
+        try:
+            await conn.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS news_url_idx ON news (url);
+            """)
+        except Exception as e:
+            logger.error(f"Помилка при створенні унікального індексу на url: {e}")
+
+    logger.info("Таблиця 'news' перевірена/оновлена.")
+
 
 async def save_news_to_db(news_items: list):
     """Зберігає список новин у базу даних, уникаючи дублікатів."""
@@ -195,6 +218,7 @@ def extract_image_url(entry) -> str:
     # 1. media_content (найкращий варіант)
     if 'media_content' in entry:
         for media in entry.media_content:
+            # Перевірка на "image" у type або medium
             if 'image' in media.get('type', '') or 'image' in media.get('medium', ''):
                 return media.get('url', '')
     
@@ -235,7 +259,7 @@ def parse_published_time(entry, rss_url) -> datetime:
     logger.warning(f"Не вдалося спарсити час публікації для {entry.get('title', '')} з {rss_url}. Використано поточний час.")
     return datetime.now(KYIV_TZ)
 
-# --- 4. ОСНОВНИЙ ПАРСИНГ (ОНОВЛЕНО) ---
+# --- 4. ОСНОВНИЙ ПАРСИНГ ---
 
 async def fetch_and_parse_source(session, rss_url: str):
     """
@@ -255,6 +279,7 @@ async def fetch_and_parse_source(session, rss_url: str):
                 return []
             content = await response.text()
     except Exception as e:
+        # Видалено Segodnya, але залишаємо загальний лог для інших проблем
         logger.error(f"Помилка AIOHTTP для {rss_url}: {e}")
         return []
 
@@ -334,9 +359,6 @@ async def send_news_to_channel(news_to_post: list):
     posted_urls = []
     
     # Сортуємо новини, щоб найстаріші з актуальних були опубліковані першими
-    # (це для дотримання хронології, якщо новин багато)
-    # Хоча тут новини з бази вже відсортовані за published_at DESC, 
-    # ми їх перевернемо, щоб постити від старішої до новішої.
     news_to_post.reverse() 
     
     for news in news_to_post[:MAX_NEWS_PER_CYCLE]:
@@ -401,6 +423,7 @@ async def auto_posting_loop(bot: Bot):
             )
             
         except Exception as e:
+            # Ця критична помилка була виправлена у init_db
             logger.error(f"Критична помилка в циклі автопостингу: {e}")
 
         # 5. Очікування наступного циклу
@@ -487,7 +510,6 @@ async def main():
 
     # 2. Налаштування та запуск бота
     global bot
-    # Використовуємо DefaultBotProperties (виправлення aiogram 3.x помилки)
     bot = Bot(
         token=BOT_TOKEN, 
         default=DefaultBotProperties(parse_mode=ParseMode.HTML)
@@ -511,7 +533,7 @@ async def main():
         for i in range(3):
             try:
                 logger.info(f"Спроба {i+1}/3: Примусове вимкнення Webhook...")
-                # Важливо: drop_pending_updates=True гарантує, що бот почне з чистого аркуша
+                # drop_pending_updates=True гарантує, що бот почне з чистого аркуша
                 await bot.delete_webhook(drop_pending_updates=True) 
                 logger.info("Webhook успішно вимкнено.")
                 break
