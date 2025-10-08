@@ -47,7 +47,7 @@ DEFAULT_HEADERS = {
     'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
 }
 
-# 1. 📰 Джерела новин (ТОП-21 УКРАЇНСЬКИХ RSS-ШЛЯХІВ)
+# 1. 📰 Джерела новин (ТОП-21 УКРАЇНСЬКИХ RSS-ШЛЯХІВ, ФІНАЛЬНА ОПТИМІЗАЦІЯ)
 SOURCES = [
     "https://epravda.com.ua/",
     "https://news.liga.net/ua/",
@@ -218,75 +218,76 @@ async def fetch_and_parse_source(session, source_url: str):
     Парсить одне джерело (зазвичай через RSS) та повертає список нових, актуальних новин.
     """
     news_items = []
-    # logger.info(f"Парсинг: {source_url}")
 
     # 1. Визначення URL для RSS
     rss_path = '/rss'
     
-    # Спеціальні випадки (КОРЕКЦІЯ RSS-ШЛЯХІВ на ЯВНІ УКРАЇНСЬКІ та надійні)
+    # Спеціальні випадки (ФІНАЛЬНА КОРЕКЦІЯ RSS-ШЛЯХІВ)
     
     if "epravda.com.ua" in source_url:
         rss_path = "/rss/"
     elif "eurointegration.com.ua" in source_url:
-        # ВИПРАВЛЕНО: Змінено на /rss (більш загальний та робочий)
-        rss_path = "/rss" 
+        # НОВА СПРОБА: більш явний шлях
+        rss_path = "/rss/news.xml" 
     elif "liga.net" in source_url:
         rss_path = "/rss.xml" 
     elif "rbc.ua" in source_url:
-        # ВИПРАВЛЕНО: Спроба україномовної версії
-        rss_path = "/rss/ukr.rss" 
+        # НОВА СПРОБА: Загальний фід
+        rss_path = "/all/rss" 
     elif "ukrinform.ua" in source_url:
-        # ВИПРАВЛЕНО: Використовуємо /rss/latest
-        rss_path = "/rss/latest"
+        # НОВА СПРОБА: Загальний фід
+        rss_path = "/rss/all.rss"
     elif "tsn.ua" in source_url:
         rss_path = "/rss"
     elif "bbci.co.uk" in source_url:
-        # ВИПРАВЛЕНО: Фід вже є повним URL, не додаємо шлях
+        # Фід вже є повним URL, не додаємо шлях
         rss_url = source_url
-        source_domain = "bbc.com/ukrainian" # Спеціальне значення для відображення
+        source_domain = "bbc.com/ukrainian" 
         pass 
     elif "korrespondent.net" in source_url:
-        # ВИПРАВЛЕНО: Спрощено до загального /rss
-        rss_path = "/rss" 
+        # НОВА СПРОБА: загальний фід
+        rss_path = "/rss/all_news" 
     elif "obozrevatel.com" in source_url:
-        # ВИПРАВЛЕНО: Спроба надійного шляху для укр. новин
-        rss_path = "/rss/rss_ukr.xml" 
+        # НОВА СПРОБА: Фід новин
+        rss_path = "/rss/news.rss" 
     elif "news.finance.ua" in source_url:
         rss_path = "/ua/rss"
     elif "suspilne.media" in source_url:
-        # ВИПРАВЛЕНО: Спроба /rss/all (обхід 403)
+        # ПОМИЛКА 403: залишаємо як є, сподіваємося на User-Agent
         rss_path = "/rss/all"
     elif "unian.ua" in source_url:
-        # ВИПРАВЛЕНО: Спрощено до /rss/news/ukr
-        rss_path = "/rss/news/ukr" 
+        # НОВА СПРОБА: З піддоменом (більш надійний)
+        rss_url = source_url.replace("www.", "rss.") + "/rss/news/ukr/feed"
+        source_domain = "unian.ua"
+        pass
     elif "interfax.com.ua" in source_url: 
-        # ВИПРАВЛЕНО: Спроба більш явного шляху
-        rss_path = "/news/ukraine.xml"
+        # НОВА СПРОБА: змінено .xml на .rss
+        rss_path = "/news/ukraine.rss"
     elif "nv.ua" in source_url:
         rss_path = "/ukr/rss/all.xml"
     elif "zaxid.net" in source_url:
         rss_path = "/rss"
     elif "hromadske.ua" in source_url:
-        # ВИПРАВЛЕНО: Спроба /feeds/all.rss
-        rss_path = "/feeds/all.rss"
+        # НОВА СПРОБА: змінено .rss на .xml
+        rss_path = "/feeds/all.xml"
     elif "censor.net" in source_url:
-        # ВИПРАВЛЕНО: Спроба /news/rss.xml (обхід 403)
+        # ПОМИЛКА 403: залишаємо як є, сподіваємося на User-Agent
         rss_path = "/news/rss.xml"
     elif "minfin.com.ua" in source_url:
-        # ВИПРАВЛЕНО: /rss/news
-        rss_path = "/rss/news"
+        # НОВА СПРОБА: /rss/feed/
+        rss_path = "/rss/feed/"
     elif "gazeta.ua" in source_url:
-        # ВИПРАВЛЕНО: /rss/ukr.rss
-        rss_path = "/rss/ukr.rss"
+        # НОВА СПРОБА: /rss/all.rss
+        rss_path = "/rss/all.rss"
     elif "focus.ua" in source_url:
-        # ВИПРАВЛЕНО: Спроба /rss/feed
-        rss_path = "/rss/feed"
+        # НОВА СПРОБА: загальний /rss
+        rss_path = "/rss"
     elif "apostrophe.ua" in source_url:
-        # ВИПРАВЛЕНО: Спроба /rss.xml
-        rss_path = "/rss.xml"
+        # НОВА СПРОБА: /rss/feed
+        rss_path = "/rss/feed"
     
-    # Якщо це не BBC, формуємо URL зі шляху
-    if "bbci.co.uk" not in source_url:
+    # Якщо це не BBC або UNIAN, формуємо URL зі шляху
+    if "bbci.co.uk" not in source_url and "unian.ua" not in source_url:
         rss_url = source_url.rstrip('/') + rss_path
         source_domain = urlparse(source_url).netloc
     
@@ -295,7 +296,6 @@ async def fetch_and_parse_source(session, source_url: str):
         # Використовуємо заголовки DEFAULT_HEADERS для обходу 403
         async with session.get(rss_url, headers=DEFAULT_HEADERS, timeout=10) as response:
             if response.status != 200:
-                # Змінено логування: тепер показує, який саме шлях дав помилку
                 logger.warning(f"Помилка {response.status} при отриманні RSS для {rss_url}")
                 return []
             content = await response.text()
@@ -333,7 +333,6 @@ async def fetch_and_parse_source(session, source_url: str):
             logger.warning(f"Помилка обробки запису з {source_url}: {e}")
             continue
 
-    # logger.info(f"Знайдено {len(news_items)} актуальних новин у {source_domain}")
     return news_items
 
 async def collect_all_news():
