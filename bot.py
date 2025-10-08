@@ -41,8 +41,8 @@ MAX_AGE_MIN = 20          # Не публікувати новини старш�
 
 # Додано User-Agent для обходу 403 помилок
 DEFAULT_HEADERS = {
-    # Більш універсальний User-Agent
-    'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)', 
+    # ВИПРАВЛЕНО: Більш надійний User-Agent, що імітує Chrome
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36', 
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
 }
@@ -50,12 +50,12 @@ DEFAULT_HEADERS = {
 # 1. 📰 Джерела новин (ТОП-21 УКРАЇНСЬКИХ RSS-ШЛЯХІВ)
 SOURCES = [
     "https://epravda.com.ua/",
-    "https://news.liga.net/ua/", # ВИПРАВЛЕНО: Явний український новинний розділ
+    "https://news.liga.net/ua/",
     "https://www.eurointegration.com.ua/",
     "https://www.rbc.ua/",
     "https://www.ukrinform.ua/",
     "https://tsn.ua/",
-    "https://www.bbc.com/ukrainian",
+    "http://feeds.bbci.co.uk/ukrainian/rss.xml", # ВИПРАВЛЕНО: Надійний Feedburner для BBC
     "https://ua.korrespondent.net/",
     "https://www.obozrevatel.com/",
     "https://news.finance.ua/",
@@ -231,8 +231,8 @@ async def fetch_and_parse_source(session, source_url: str):
         # Виправлено: спрощено до загального шляху
         rss_path = "/rss.xml" 
     elif "liga.net" in source_url:
-        # ВИПРАВЛЕНО для https://news.liga.net/ua/
-        rss_path = "/all/rss.xml" 
+        # ВИПРАВЛЕНО: для https://news.liga.net/ua/ використовуємо загальний шлях
+        rss_path = "/rss.xml" 
     elif "rbc.ua" in source_url:
         # Виправлено: змінено на більш загальний
         rss_path = "/rss/news" 
@@ -240,8 +240,11 @@ async def fetch_and_parse_source(session, source_url: str):
         rss_path = "/rss.xml"
     elif "tsn.ua" in source_url:
         rss_path = "/rss"
-    elif "bbc.com/ukrainian" in source_url:
-        rss_path = "/rss.xml"
+    elif "bbci.co.uk" in source_url:
+        # ВИПРАВЛЕНО: Фід вже є повним URL, не додаємо шлях
+        rss_url = source_url
+        source_domain = "bbc.com/ukrainian" # Спеціальне значення для відображення
+        pass 
     elif "korrespondent.net" in source_url:
         # Виправлено: спрощено до загального
         rss_path = "/rss/all_news" 
@@ -251,8 +254,8 @@ async def fetch_and_parse_source(session, source_url: str):
     elif "news.finance.ua" in source_url:
         rss_path = "/ua/rss"
     elif "suspilne.media" in source_url:
-        # Виправлено: спрощено до загального
-        rss_path = "/rss"
+        # ВИПРАВЛЕНО: Спроба надійнішого шляху
+        rss_path = "/feed/all/rss.xml"
     elif "unian.ua" in source_url:
         # Виправлено: явний український фід
         rss_path = "/rss/news/ukr/feed" 
@@ -277,9 +280,12 @@ async def fetch_and_parse_source(session, source_url: str):
     elif "apostrophe.ua" in source_url:
         # Виправлено: змінено на робочий шлях
         rss_path = "/rss/feed.xml"
-
-    rss_url = source_url.rstrip('/') + rss_path
-
+    
+    # Якщо це не BBC, формуємо URL зі шляху
+    if "bbci.co.uk" not in source_url:
+        rss_url = source_url.rstrip('/') + rss_path
+        source_domain = urlparse(source_url).netloc
+    
     # 2. Запит
     try:
         # Використовуємо заголовки DEFAULT_HEADERS для обходу 403
@@ -297,7 +303,6 @@ async def fetch_and_parse_source(session, source_url: str):
     feed = feedparser.parse(content)
     now_kyiv = datetime.now(KYIV_TZ)
     max_age_dt = timedelta(minutes=MAX_AGE_MIN)
-    source_domain = urlparse(source_url).netloc
 
     for entry in feed.entries[:FETCH_LIMIT]:
         try:
@@ -516,10 +521,17 @@ async def main():
     logger.info("Бот запущено. Початок роботи.")
 
     try:
-        # 🚨 АВТОМАТИЧНЕ ВИМКНЕННЯ WEBHOOK для вирішення TelegramConflictError
-        logger.info("Примусове вимкнення Webhook...")
-        await bot.delete_webhook(drop_pending_updates=True)
-        
+        # 🚨 АВТОМАТИЧНЕ ВИМКНЕННЯ WEBHOOK з повторними спробами
+        for i in range(3):
+            try:
+                logger.info(f"Спроба {i+1}/3: Примусове вимкнення Webhook...")
+                await bot.delete_webhook(drop_pending_updates=True)
+                logger.info("Webhook успішно вимкнено.")
+                break
+            except Exception as e:
+                logger.warning(f"Помилка вимкнення Webhook: {e}. Затримка 5 сек...")
+                await asyncio.sleep(5)
+
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
