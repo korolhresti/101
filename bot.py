@@ -35,7 +35,7 @@ except ValueError:
 
 # Конфігурація бота
 POSTING_INTERVAL_MIN = 5  # Кожні 5 хвилин
-# ЗБІЛЬШЕНО: До 100 новин за цикл
+# До 100 новин за цикл
 MAX_NEWS_PER_CYCLE = 100   
 MAX_AGE_MIN = 20          # Не публікувати новини старше 20 хвилин
 
@@ -46,9 +46,9 @@ DEFAULT_HEADERS = {
     'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7', # Додано українську мову
 }
 
-# 1. 📰 Джерела новин (ТОП-22 УКРАЇНСЬКИХ RSS-ШЛЯХІВ)
+# 1. 📰 Джерела новин (ТОП-21 УКРАЇНСЬКИХ RSS-ШЛЯХІВ)
 SOURCES = [
-    "https://www.pravda.com.ua/",
+    # "https://www.pravda.com.ua/" - ВИДАЛЕНО, залишено лише Економічну правду
     "https://epravda.com.ua/",
     "https://www.eurointegration.com.ua/",
     "https://www.liga.net/",
@@ -225,9 +225,7 @@ async def fetch_and_parse_source(session, source_url: str):
     
     # Спеціальні випадки (КОРЕКЦІЯ RSS-ШЛЯХІВ на ЯВНІ УКРАЇНСЬКІ)
     
-    if "pravda.com.ua" in source_url: 
-        rss_url = "https://www.pravda.com.ua/rss/" 
-    elif "epravda.com.ua" in source_url:
+    if "epravda.com.ua" in source_url:
         rss_url = "https://www.epravda.com.ua/rss/"
     elif "eurointegration.com.ua" in source_url:
         rss_url = "https://www.eurointegration.com.ua/articles/rss/" 
