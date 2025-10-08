@@ -47,12 +47,11 @@ DEFAULT_HEADERS = {
     'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
 }
 
-# 1. 📰 Джерела новин (ФІНАЛЬНА ОПТИМІЗАЦІЯ)
+# 1️⃣ Джерела новин України (перевірені)
 SOURCES = [
     "https://tsn.ua/rss/all.xml",
     "https://www.pravda.com.ua/rss/news/",
     "https://censor.net/rss/all_news",
-    "https://www.bbc.com/ukrainian/index.xml",
     "https://www.rbc.ua/static/rss/all.xml",
     "https://www.ukrinform.ua/rss/all.xml",
     "https://hromadske.ua/feed",
@@ -65,13 +64,49 @@ SOURCES = [
     "https://gazeta.ua/rss/all",
     "https://24tv.ua/rss/all.xml",
     "https://nv.ua/rss/all.xml",
-    "https://uain.press/rss",
-    "https://suspilne.media/feed/",
     "https://delo.ua/rss/all.xml",
-    "https://www.segodnya.ua/rss/all.xml"
+    "https://suspilne.media/feed/",
+    "https://uain.press/rss",
+    "https://www.segodnya.ua/rss/news.xml",
+    "https://www.bbc.com/ukrainian/rss.xml"
 ]
 
-FETCH_LIMIT = 500
+# Ліміти
+FETCH_LIMIT = 100
+
+# 2️⃣ Заголовки для сайтів, що блокують ботів
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                  "AppleWebKit/537.36 (KHTML, like Gecko) "
+                  "Chrome/139.0.0.0 Safari/537.36"
+}
+
+# 3️⃣ Завантаження RSS з обробкою помилок
+async def fetch_rss(session, url):
+    try:
+        async with session.get(url, headers=HEADERS, timeout=10) as resp:
+            if resp.status == 200:
+                text = await resp.text()
+                feed = feedparser.parse(text)
+                return feed
+            else:
+                logger.warning(f"Помилка {resp.status} при отриманні RSS для {url}")
+                return None
+    except Exception as e:
+        logger.error(f"AIOHTTP помилка для {url}: {e}")
+        return None
+
+# 4️⃣ Приклад асинхронного завантаження всіх джерел
+async def fetch_all_sources():
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_rss(session, url) for url in SOURCES]
+        results = await asyncio.gather(*tasks)
+        return [feed for feed in results if feed is not None]
+
+# ===== Тест =====
+if __name__ == "__main__":
+    feeds = asyncio.run(fetch_all_sources())
+    logger.info(f"Успішно отримано {len(feeds)} RSS з усіх джерел.")
 
 # Глобальний пул підключень до бази даних
 db_pool = None
