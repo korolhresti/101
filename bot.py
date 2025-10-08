@@ -11,7 +11,7 @@ from bs4 import BeautifulSoup
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
-from aiogram.filters import Command
+from aiogram.filters import Command # Залишаємо лише для використання як фільтр у dp.message.register
 
 # --- 1. НАЛАШТУВАННЯ І КОНСТАНТИ ---
 
@@ -87,7 +87,6 @@ async def create_news_table():
     що призвела до помилки "cannot drop table news".
     """
     # 1. Видалення залежної таблиці (яка спричинила помилку)
-    # Це єдине виправлення, необхідне для запуску бота.
     DROP_DEPENDENCY_SQL = """
     DROP TABLE IF EXISTS moderation_logs;
     """
@@ -351,10 +350,7 @@ async def post_news_cycle(bot: Bot):
              text += f"\n\n🕒 {published_time_str}"
         
         try:
-            # Telegram Bot API має обмеження на розмір підпису/тексту, 
-            # 1024 символів для підпису фото і 4096 для повідомлення.
-            # Наш ліміт 700 символів на summary дозволяє не перевищувати їх.
-
+            # Telegram Bot API має обмеження на розмір підпису/тексту
             if news['image_url']:
                 # Публікація з фото (якщо є)
                 await bot.send_photo(
@@ -381,7 +377,6 @@ async def post_news_cycle(bot: Bot):
             # Якщо постингу не відбулося, не оновлюємо posted_at
 
     # 5. Оновлення posted_at для успішно опублікованих новин
-    # Це гарантує, що posted_at відображає фактичний час публікації в Telegram
     await update_posted_at(urls_posted_successfully)
 
 
@@ -391,10 +386,8 @@ async def post_news_cycle(bot: Bot):
 
 
 # --- 5. КОМАНДИ АДМІНІСТРАТОРА (aiogram) ---
+# ВИПРАВЛЕНО: Видалено декоратори @Command та @F.from_user.id.in_
 
-# /status
-@Command("status")
-@F.from_user.id.in_({ADMIN_ID}) # Обмежуємо доступ лише для ADMIN_ID
 async def cmd_status(message: types.Message):
     """Показує статистику бота."""
     total_news = 0
@@ -424,18 +417,12 @@ async def cmd_status(message: types.Message):
     )
     await message.answer(status_message, parse_mode=ParseMode.MARKDOWN)
 
-# /forcepost
-@Command("forcepost")
-@F.from_user.id.in_({ADMIN_ID})
 async def cmd_forcepost(message: types.Message, bot: Bot):
     """Запускає позачергову перевірку і постинг новин."""
     await message.answer("🔄 Запускаю позачерговий цикл парсингу та постингу...")
     await post_news_cycle(bot)
     await message.answer("✅ Позачерговий цикл завершено.")
 
-# /stats
-@Command("stats")
-@F.from_user.id.in_({ADMIN_ID})
 async def cmd_stats(message: types.Message):
     """Показує кількість опублікованих новин за добу."""
     news_24h = 0
@@ -498,7 +485,8 @@ async def main():
     global dp
     dp = Dispatcher()
     
-    # Реєстрація команд адміністратора
+    # Реєстрація команд адміністратора (Фільтри тепер тільки тут)
+    # Зверніть увагу, що cmd_forcepost має приймати bot, тому його реєструємо інакше
     dp.message.register(cmd_status, Command("status"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_forcepost, Command("forcepost"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_stats, Command("stats"), F.from_user.id == ADMIN_ID)
