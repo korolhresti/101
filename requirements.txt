@@ -1,4 +1,4 @@
-aiogram==3.12.5
+aiogram==3.13.1
 aiohttp==3.10.2
 asyncpg==0.29.0
 beautifulsoup4==4.12.3
@@ -11,4 +11,4 @@ requests==2.32.3
 schedule==1.2.2
 setuptools==75.1.0
 wheel==0.45.1
-pip==25.1.1
+pip==25.2
