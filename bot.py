@@ -12,6 +12,8 @@ from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
+# НОВИЙ ІМПОРТ: Потрібен для налаштування DefaultBotProperties
+from aiogram.client.default import DefaultBotProperties 
 
 # --- 1. НАЛАШТУВАННЯ І КОНСТАНТИ ---
 
@@ -167,7 +169,7 @@ async def update_posted_at(urls_list):
 def parse_published_time(entry, source_url: str) -> datetime:
     """Намагається отримати та нормалізувати час публікації."""
     try:
-        # Використовуємо .get('published_parsed') або 'updated_parsed'
+        # Використовуємо .get('published_parsed') або 'updated_parsed')
         parsed_time = None
         if hasattr(entry, 'published_parsed') and entry.published_parsed:
             parsed_time = entry.published_parsed
@@ -222,7 +224,6 @@ async def fetch_and_parse_source(session, source_url: str):
     logger.info(f"Парсинг: {source_url}")
 
     # 1. Визначення URL для RSS (налаштування для деяких джерел)
-    # Стандартний варіант
     rss_url = source_url.rstrip('/') + '/rss'
     
     # Спеціальні випадки (враховуємо нові адреси)
@@ -460,12 +461,12 @@ async def main():
         return
 
     # Ініціалізація Telegram
-    bot = Bot(token=BOT_TOKEN, parse_mode=ParseMode.HTML)
+    # ВИПРАВЛЕНО: використання DefaultBotProperties для parse_mode
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     global dp
     dp = Dispatcher()
     
-    # Реєстрація команд адміністратора (ВИПРАВЛЕНО: використання F-фільтрів та Command)
-    # Зверніть увагу, що тут ми використовуємо F.from_user.id == ADMIN_ID для фільтрації адміністратора
+    # Реєстрація команд адміністратора
     dp.message.register(cmd_status, Command("status"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_forcepost, Command("forcepost"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_stats, Command("stats"), F.from_user.id == ADMIN_ID)
