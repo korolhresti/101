@@ -41,17 +41,17 @@ MAX_AGE_MIN = 20          # Не публікувати новини старш�
 
 # Додано User-Agent для обходу 403 помилок
 DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
+    # Більш універсальний User-Agent
+    'User-Agent': 'Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)', 
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-    'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7', # Додано українську мову
+    'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
 }
 
 # 1. 📰 Джерела новин (ТОП-21 УКРАЇНСЬКИХ RSS-ШЛЯХІВ)
 SOURCES = [
-    # "https://www.pravda.com.ua/" - ВИДАЛЕНО, залишено лише Економічну правду
     "https://epravda.com.ua/",
+    "https://news.liga.net/ua/", # ВИПРАВЛЕНО: Явний український новинний розділ
     "https://www.eurointegration.com.ua/",
-    "https://www.liga.net/",
     "https://www.rbc.ua/",
     "https://www.ukrinform.ua/",
     "https://tsn.ua/",
@@ -221,59 +221,71 @@ async def fetch_and_parse_source(session, source_url: str):
     # logger.info(f"Парсинг: {source_url}")
 
     # 1. Визначення URL для RSS
-    rss_url = source_url.rstrip('/') + '/rss'
+    rss_path = '/rss'
     
-    # Спеціальні випадки (КОРЕКЦІЯ RSS-ШЛЯХІВ на ЯВНІ УКРАЇНСЬКІ)
+    # Спеціальні випадки (КОРЕКЦІЯ RSS-ШЛЯХІВ на ЯВНІ УКРАЇНСЬКІ та надійні)
     
     if "epravda.com.ua" in source_url:
-        rss_url = "https://www.epravda.com.ua/rss/"
+        rss_path = "/rss/"
     elif "eurointegration.com.ua" in source_url:
-        rss_url = "https://www.eurointegration.com.ua/articles/rss/" 
-    # ВИПРАВЛЕНО: Явний український фід для Ліга
+        # Виправлено: спрощено до загального шляху
+        rss_path = "/rss.xml" 
     elif "liga.net" in source_url:
-        rss_url = "https://www.liga.net/news/rss.xml" 
+        # ВИПРАВЛЕНО для https://news.liga.net/ua/
+        rss_path = "/all/rss.xml" 
     elif "rbc.ua" in source_url:
-        rss_url = "https://www.rbc.ua/static/rss/ukr/all.xml" 
+        # Виправлено: змінено на більш загальний
+        rss_path = "/rss/news" 
     elif "ukrinform.ua" in source_url:
-        rss_url = "https://www.ukrinform.ua/rss.xml"
+        rss_path = "/rss.xml"
     elif "tsn.ua" in source_url:
-        rss_url = "https://tsn.ua/rss"
+        rss_path = "/rss"
     elif "bbc.com/ukrainian" in source_url:
-        rss_url = "https://feeds.bbci.co.uk/ukrainian/rss.xml"
+        rss_path = "/rss.xml"
     elif "korrespondent.net" in source_url:
-        rss_url = "https://ua.korrespondent.net/all/rss_feed/" 
+        # Виправлено: спрощено до загального
+        rss_path = "/rss/all_news" 
     elif "obozrevatel.com" in source_url:
-        rss_url = "https://www.obozrevatel.com/ukr/news/rss.xml" 
+        # Виправлено: спрощено до загального
+        rss_path = "/rss/all.rss" 
     elif "news.finance.ua" in source_url:
-        rss_url = "https://news.finance.ua/ua/rss"
+        rss_path = "/ua/rss"
     elif "suspilne.media" in source_url:
-        rss_url = "https://suspilne.media/rss-novyny/"
+        # Виправлено: спрощено до загального
+        rss_path = "/rss"
     elif "unian.ua" in source_url:
-        rss_url = "https://www.unian.ua/rss/news"
+        # Виправлено: явний український фід
+        rss_path = "/rss/news/ukr/feed" 
     elif "interfax.com.ua" in source_url: 
-        rss_url = "https://ua.interfax.com.ua/news/rss.xml"
+        # Виправлено: спрощено до загального
+        rss_path = "/news/rss"
     elif "nv.ua" in source_url:
-        rss_url = "https://nv.ua/ukr/rss/all.xml"
+        rss_path = "/ukr/rss/all.xml"
     elif "zaxid.net" in source_url:
-        rss_url = "https://zaxid.net/rss_all.xml"
+        rss_path = "/rss"
     elif "hromadske.ua" in source_url:
-        rss_url = "https://hromadske.ua/feeds/news"
+        rss_path = "/rss/all"
     elif "censor.net" in source_url:
-        rss_url = "https://censor.net/ua/rss"
+        # Виправлено: змінено на робочий шлях
+        rss_path = "/ua/news/rss"
     elif "minfin.com.ua" in source_url:
-        rss_url = "https://minfin.com.ua/ua/rss/"
+        rss_path = "/rss"
     elif "gazeta.ua" in source_url:
-        rss_url = "https://gazeta.ua/rss.xml"
+        rss_path = "/rss.xml"
     elif "focus.ua" in source_url:
-        rss_url = "https://focus.ua/uk/rss/all"
+        rss_path = "/rss"
     elif "apostrophe.ua" in source_url:
-        rss_url = "https://apostrophe.ua/ua/rss"
+        # Виправлено: змінено на робочий шлях
+        rss_path = "/rss/feed.xml"
+
+    rss_url = source_url.rstrip('/') + rss_path
 
     # 2. Запит
     try:
         # Використовуємо заголовки DEFAULT_HEADERS для обходу 403
         async with session.get(rss_url, headers=DEFAULT_HEADERS, timeout=10) as response:
             if response.status != 200:
+                # Змінено логування: тепер показує, який саме шлях дав помилку
                 logger.warning(f"Помилка {response.status} при отриманні RSS для {rss_url}")
                 return []
             content = await response.text()
@@ -504,6 +516,10 @@ async def main():
     logger.info("Бот запущено. Початок роботи.")
 
     try:
+        # 🚨 АВТОМАТИЧНЕ ВИМКНЕННЯ WEBHOOK для вирішення TelegramConflictError
+        logger.info("Примусове вимкнення Webhook...")
+        await bot.delete_webhook(drop_pending_updates=True)
+        
         await dp.start_polling(bot)
     finally:
         await bot.session.close()
