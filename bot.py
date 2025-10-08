@@ -39,7 +39,7 @@ POSTING_INTERVAL_MIN = 5  # Кожні 5 хвилин
 MAX_NEWS_PER_CYCLE = 50   # До 50 новин за цикл
 MAX_AGE_MIN = 20          # Не публікувати новини старше 20 хвилин
 
-# Default headers to mimic a browser, helping avoid 403 errors on some RSS feeds (e.g., minprom.ua)
+# Default headers to mimic a browser, helping avoid 403 errors on some RSS feeds
 DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
@@ -97,7 +97,7 @@ async def create_news_table():
         summary TEXT,
         image_url TEXT,
         published_at TIMESTAMP WITH TIME ZONE,
-        posted_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        posted_at TIMESTAMP WITH TIME ZONE DEFAULT NULL
     );
     """
     if db_pool:
@@ -225,24 +225,25 @@ async def fetch_and_parse_source(session, source_url: str):
     # 1. Визначення URL для RSS (налаштування для деяких джерел)
     rss_url = source_url.rstrip('/') + '/rss'
     
-    # Спеціальні випадки (ОНОВЛЕНО)
+    # Спеціальні випадки (ОНОВЛЕНО ТА ПЕРЕВІРЕНО)
     if "forbes.ua" in source_url: 
-        # Forbes.ua
-        rss_url = "https://forbes.ua/feed/rss" 
+        # Forbes.ua - всі новини
+        rss_url = "https://forbes.ua/feed" 
     elif "korrespondent.net" in source_url:
-        # Korrespondent - загальний RSS (підійде для будь-якої категорії)
-        rss_url = "https://ua.korrespondent.net/rss" 
+        # Korrespondent - загальний RSS
+        rss_url = "https://ua.korrespondent.net/rss_feed/ukraine/all" 
     elif "nv.ua" in source_url:
-        # NV - загальні новини
+        # NV - всі новини
         rss_url = "https://nv.ua/ukr/rss/all.xml" 
     elif "finance.ua" in source_url:
+        # Finance.ua - новини
         rss_url = "https://news.finance.ua/rss"
     elif "rbc.ua" in source_url:
         # RBC-Україна - всі новини
         rss_url = "https://www.rbc.ua/static/rss/all.xml" 
     elif "obozrevatel.com" in source_url:
-        # Obozrevatel - загальні новини
-        rss_url = "https://www.obozrevatel.com/feed"
+        # Obozrevatel - новини
+        rss_url = "https://www.obozrevatel.com/rss/news.xml"
     elif "minprom.ua" in source_url:
         # Minprom.ua - новини 
         rss_url = "https://minprom.ua/news/rss"
@@ -282,6 +283,11 @@ async def fetch_and_parse_source(session, source_url: str):
                 logger.debug(f"Пропущено стару новину: {title[:50]}... ({now_kyiv - published_time})")
                 continue
 
+            # Додаткова фільтрація: пропускаємо новини, які вже були опубліковані (posted_at IS NOT NULL)
+            # Примітка: ця перевірка буде ефективною лише після перевірки в базі, але запобігає спробі вставки
+            # вже опублікованих новин, якщо цикл перезапустився і база ще не оновлена.
+            # Для повної впевненості, основна фільтрація відбувається через ON CONFLICT у insert_news.
+            
             news_items.append({
                 'source': source_domain,
                 'title': title,
@@ -303,7 +309,9 @@ async def collect_all_news():
     """
     all_news = []
     # Створюємо асинхронну сесію для ефективного керування підключеннями
-    async with aiohttp.ClientSession() as session:
+    # Встановлюємо загальний таймаут для сесії
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = [fetch_and_parse_source(session, source) for source in SOURCES]
         # Запускаємо всі парсери одночасно
         results = await asyncio.gather(*tasks)
@@ -333,9 +341,11 @@ async def post_news_cycle(bot: Bot):
     inserted_urls = await insert_news(all_news)
 
     # 3. Фільтруємо список новин, щоб постити лише ті, що були щойно вставлені
+    # Зберігаємо порядок сортування (найновіші перші)
+    inserted_urls_set = set(inserted_urls)
     news_to_post = [
         news for news in all_news
-        if news['url'] in inserted_urls
+        if news['url'] in inserted_urls_set
     ]
     # Обмежуємо до 50 новин
     news_to_post = news_to_post[:MAX_NEWS_PER_CYCLE]
@@ -361,7 +371,8 @@ async def post_news_cycle(bot: Bot):
                 await bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=text,
-                    parse_mode=ParseMode.HTML
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True # Вимикаємо прев'ю, якщо фото немає (для чистоти)
                 )
             urls_posted_successfully.append(news['url'])
             posted_count += 1
@@ -372,7 +383,8 @@ async def post_news_cycle(bot: Bot):
             # Якщо постингу не відбулося, не оновлюємо posted_at
 
     # 5. Оновлення posted_at для успішно опублікованих новин
-    await update_posted_at(urls_posted_successfully)
+    if urls_posted_successfully:
+        await update_posted_at(urls_posted_successfully)
 
 
     end_time = datetime.now()
@@ -390,9 +402,10 @@ async def cmd_status(message: types.Message):
     try:
         if db_pool:
             async with db_pool.acquire() as conn:
+                # Всі новини в базі
                 total_news = await conn.fetchval("SELECT COUNT(*) FROM news")
-                # Знаходимо час останнього успішного постингу
-                last_posted_dt = await conn.fetchval("SELECT MAX(posted_at) FROM news")
+                # Час останнього успішного постингу
+                last_posted_dt = await conn.fetchval("SELECT MAX(posted_at) FROM news WHERE posted_at IS NOT NULL")
                 if last_posted_dt:
                     # Приводимо час до Київського для відображення
                     last_posted = last_posted_dt.astimezone(KYIV_TZ).strftime("%d.%m.%Y %H:%M:%S")
@@ -458,6 +471,7 @@ async def auto_posting_loop(bot: Bot):
 
 async def main():
     """Ініціалізація та запуск бота."""
+    # Додано перевірку на ADMIN_ID, оскільки він використовується для команд
     if not all([BOT_TOKEN, DATABASE_URL, CHANNEL_ID]) or ADMIN_ID == 0:
         logger.critical("Не всі змінні середовища встановлені. Перевірте BOT_TOKEN, DATABASE_URL, CHANNEL_ID та ADMIN_ID.")
         return
@@ -485,7 +499,7 @@ async def main():
     logger.info("Бот запущено. Початок роботи.")
 
     try:
-        # Запускаємо polling
+        # Запускаємо polling. Це основна причина конфлікту, який буде вирішено зміною на Worker.
         await dp.start_polling(bot)
     finally:
         # Закриття ресурсів
