@@ -359,8 +359,6 @@ async def post_news_cycle(bot: Bot):
 # --- 5. КОМАНДИ АДМІНІСТРАТОРА (aiogram) ---
 
 # /status
-@Command("status")
-@F.from_user.id.in_({ADMIN_ID}) # Обмежуємо доступ лише для ADMIN_ID
 async def cmd_status(message: types.Message):
     """Показує статистику бота."""
     total_news = 0
@@ -391,8 +389,6 @@ async def cmd_status(message: types.Message):
     await message.answer(status_message, parse_mode=ParseMode.MARKDOWN)
 
 # /forcepost
-@Command("forcepost")
-@F.from_user.id.in_({ADMIN_ID})
 async def cmd_forcepost(message: types.Message, bot: Bot):
     """Запускає позачергову перевірку і постинг новин."""
     await message.answer("🔄 Запускаю позачерговий цикл парсингу та постингу...")
@@ -400,8 +396,6 @@ async def cmd_forcepost(message: types.Message, bot: Bot):
     await message.answer("✅ Позачерговий цикл завершено.")
 
 # /stats
-@Command("stats")
-@F.from_user.id.in_({ADMIN_ID})
 async def cmd_stats(message: types.Message):
     """Показує кількість опублікованих новин за добу."""
     news_24h = 0
@@ -455,7 +449,7 @@ async def main():
     global dp
     dp = Dispatcher()
     
-    # Реєстрація команд адміністратора
+    # Реєстрація команд адміністратора (це правильно і тепер працюватиме)
     dp.message.register(cmd_status, Command("status"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_forcepost, Command("forcepost"), F.from_user.id == ADMIN_ID)
     dp.message.register(cmd_stats, Command("stats"), F.from_user.id == ADMIN_ID)
@@ -482,3 +476,4 @@ if __name__ == "__main__":
         logger.info("Програма зупинена користувачем.")
     except Exception as e:
         logger.critical(f"Загальна помилка при запуску: {e}")
+}
