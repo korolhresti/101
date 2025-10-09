@@ -62,7 +62,7 @@ SOURCES = [
     "https://www.liga.net/rss/news.xml",
     "https://gazeta.ua/rss/all",
     "https://24tv.ua/rss/all.xml",
-    "https://nv.ua/rss/all.xml",
+    "https://nv.ua/ukr/rss/all.xml",
     "https://delo.ua/rss/all.xml",
     "https://suspilne.media/feed/",
     "https://uain.press/rss",
