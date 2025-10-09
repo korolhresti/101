@@ -203,6 +203,36 @@ async def get_db_stats():
 
 # --- 3. ХЕЛПЕРИ ПАРСИНГУ ---
 
+def is_news_relevant(title: str, summary: str) -> bool:
+    """Перевіряє, чи не стосується новина заблокованих тем (зірки, футбол)."""
+    text = (title + " " + summary).lower()
+    
+    # Ключові слова для блокування новин про зірок/шоу-бізнес
+    celebrity_keywords = [
+        "зірок", "зірка", "шоу-бізнес", "світське життя", "особисте життя", 
+        "відпочинок", "вагітність", "розлучення", "скандал", "тсн.особливе",
+        "телебачення", "кіно", "мода", "гламур"
+    ]
+    
+    # Ключові слова для блокування новин про футбол
+    football_keywords = [
+        "футбол", "матч", "ліга чемпіонів", "збірна україни з футболу", 
+        "чемпіонат світу з футболу", "чемпіонат україни з футболу", "прем'єр-ліга",
+        "динамо", "шахтар", "фк " # ФК Динамо, ФК Шахтар і т.д.
+    ]
+
+    for keyword in celebrity_keywords:
+        if keyword in text:
+            logger.debug(f"Пропущено новину (ЗІРКИ): {title[:50]}...")
+            return False
+
+    for keyword in football_keywords:
+        if keyword in text:
+            logger.debug(f"Пропущено новину (ФУТБОЛ): {title[:50]}...")
+            return False
+            
+    return True
+    
 def normalize_summary(text: str) -> str:
     """Очищає та нормалізує текст анотації, видаляючи HTML/зайві символи."""
     if not text:
@@ -292,6 +322,11 @@ async def fetch_and_parse_source(session, rss_url: str):
             url = entry.link
             title = entry.title
             summary = normalize_summary(entry.get('summary') or entry.get('description') or entry.title)
+            
+            # 💡 НОВИЙ ФІЛЬТР: Перевірка на нерелевантні теми
+            if not is_news_relevant(title, summary):
+                continue
+
             image_url = extract_image_url(entry)
             published_time = parse_published_time(entry, rss_url)
 
@@ -381,9 +416,8 @@ async def send_news_to_channel(news_to_post: list):
             posted_urls.append(news['url'])
             
         except Exception as e:
-            # Якщо поширеною є помилка Bad Request: wrong type of the web page content, ми ігноруємо її та не позначаємо як опубліковану
-            logger.error(f"Помилка відправки новини '{news['title'][:50]}...': {e}")
             # У разі помилки відправки (особливо з фото), ми НЕ позначаємо новину як опубліковану.
+            logger.error(f"Помилка відправки новини '{news['title'][:50]}...': {e}")
             continue 
 
     await mark_news_as_posted(posted_urls)
