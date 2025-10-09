@@ -26,9 +26,9 @@ logging.basicConfig(level=logging.INFO,
 logger = logging.getLogger(__name__)
 
 # Змінні середовища (читаються з Render Environment)
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") # 🚨 ВИПРАВЛЕНО: Використовуємо TELEGRAM_BOT_TOKEN 
 DATABASE_URL = os.getenv("DATABASE_URL")
-CHANNEL_ID = os.getenv("CHANNEL_ID") # Приклад: -1002766273069
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID") # 🚨 ВИПРАВЛЕНО: Використовуємо TELEGRAM_CHANNEL_ID
 try:
     ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 except ValueError:
@@ -39,14 +39,14 @@ POSTING_INTERVAL_MIN = 5  # Кожні 5 хвилин
 MAX_NEWS_PER_CYCLE = 100   # До 100 новин за цикл
 MAX_AGE_MIN = 20          # Не публікувати новини старше 20 хвилин
 
-# Додано User-Agent для обходу 403 помилок (ОНОВЛЕНО)
+# Додано User-Agent для обходу 403 помилок
 DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36', 
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
     'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
 }
 
-# 1. 📰 Джерела новин (НОВИЙ, ПЕРЕВІРЕНИЙ СПИСОК ПОВНИХ RSS-ШЛЯХІВ)
+# 1. 📰 Джерела новин
 SOURCES = [
     "https://tsn.ua/rss/all.xml",
     "https://www.pravda.com.ua/rss/news/",
@@ -66,7 +66,6 @@ SOURCES = [
     "https://delo.ua/rss/all.xml",
     "https://suspilne.media/feed/",
     "https://uain.press/rss",
-    # "https://www.segodnya.ua/rss/news.xml", # Видалено через постійну помилку DNS/блокування
     "https://www.bbc.com/ukrainian/rss.xml",
     "https://www.eurointegration.com.ua/rss/rss.xml", 
     "https://news.finance.ua/ua/rss", 
@@ -93,11 +92,15 @@ async def connect_db():
     except Exception as e:
         logger.error(f"Помилка підключення до DB: {e}")
         # Вихід із програми, якщо не вдалося підключитися
-        exit(1)
+        # exit(1) # Залишаємо виключення лише для локального запуску/main, щоб Render міг перезапустити 
 
 # ВИПРАВЛЕНО: Додана логіка ALTER TABLE для оновлення структури бази
 async def init_db():
     """Створює таблицю 'news', якщо вона не існує, та додає необхідні стовпці."""
+    if not db_pool:
+        logger.error("Не вдалося ініціалізувати DB, пул з'єднань відсутній.")
+        return
+
     async with db_pool.acquire() as conn:
         # 1. Створення таблиці, якщо не існує
         await conn.execute("""
@@ -138,7 +141,7 @@ async def init_db():
 
 async def save_news_to_db(news_items: list):
     """Зберігає список новин у базу даних, уникаючи дублікатів."""
-    if not news_items:
+    if not news_items or not db_pool:
         return 0
     
     # Використовуємо UNNEST для масової вставки
@@ -163,6 +166,9 @@ async def save_news_to_db(news_items: list):
 
 async def get_unique_news_from_db(limit: int) -> list:
     """Вибирає найновіші, ще не опубліковані новини з бази."""
+    if not db_pool:
+        return []
+
     sql = """
         SELECT url, title, summary, image_url, source
         FROM news
@@ -176,7 +182,7 @@ async def get_unique_news_from_db(limit: int) -> list:
 
 async def mark_news_as_posted(urls: list):
     """Позначає новини, що були успішно опубліковані."""
-    if not urls:
+    if not urls or not db_pool:
         return
     sql = """
         UPDATE news
@@ -188,6 +194,9 @@ async def mark_news_as_posted(urls: list):
 
 async def get_db_stats():
     """Повертає статистику бази даних."""
+    if not db_pool:
+        return None
+
     sql = """
         SELECT 
             (SELECT count(*) FROM news) AS total_news,
@@ -279,7 +288,6 @@ async def fetch_and_parse_source(session, rss_url: str):
                 return []
             content = await response.text()
     except Exception as e:
-        # Видалено Segodnya, але залишаємо загальний лог для інших проблем
         logger.error(f"Помилка AIOHTTP для {rss_url}: {e}")
         return []
 
@@ -378,7 +386,9 @@ async def send_news_to_channel(news_to_post: list):
                 await bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=caption,
-                    parse_mode=ParseMode.HTML
+                    parse_mode=ParseMode.HTML,
+                    # 💡 ВИПРАВЛЕНО: Вимикає web page preview для уніфікації формату (без "Миттєвого перегляду")
+                    disable_web_page_preview=True 
                 )
             
             # Затримка між постами, щоб уникнути спам-блокування
@@ -423,7 +433,6 @@ async def auto_posting_loop(bot: Bot):
             )
             
         except Exception as e:
-            # Ця критична помилка була виправлена у init_db
             logger.error(f"Критична помилка в циклі автопостингу: {e}")
 
         # 5. Очікування наступного циклу
@@ -440,7 +449,7 @@ async def cmd_status(message: types.Message):
         f"⏱️ Макс. вік новини: {MAX_AGE_MIN} хв\n"
         f"📝 Макс. постів за цикл: {MAX_NEWS_PER_CYCLE}\n"
         f"📰 Джерел: {len(SOURCES)}\n"
-        f"⚙️ Webhook: Вимкнено (Polling Mode)\n"
+        f"⚙️ Режим: Polling Mode\n"
         f"🔑 Admin ID: <code>{ADMIN_ID}</code>\n"
         f"📢 Channel ID: <code>{CHANNEL_ID}</code>"
     )
@@ -452,6 +461,11 @@ async def cmd_forcepost(message: types.Message):
     
     # Використовуємо окрему асинхронну функцію для виконання циклу один раз
     async def run_once(bot_instance):
+        # ❗ ПЕРЕВІРКА: Уникаємо повторного виклику, якщо main() не вдалася
+        if not bot_instance or not db_pool:
+            await bot.send_message(message.chat.id, "❌ Бот не ініціалізовано. Перевірте логи запуску.", parse_mode=ParseMode.HTML)
+            return
+
         try:
             start_time = datetime.now()
             fetched_news = await fetch_all_sources()
@@ -489,7 +503,7 @@ async def cmd_stats(message: types.Message):
             f"• 📰 Активних джерел: {stats.get('total_sources', 0)}"
         )
     else:
-        stats_msg = "❌ Не вдалося отримати статистику з бази даних."
+        stats_msg = "❌ Не вдалося отримати статистику з бази даних. Перевірте підключення до Neon."
 
     await message.answer(stats_msg, parse_mode=ParseMode.HTML)
 
@@ -499,13 +513,24 @@ async def cmd_stats(message: types.Message):
 async def main():
     """Основна функція для ініціалізації та запуску бота."""
     
-    # Перевірка наявності змінних середовища
-    if not all([BOT_TOKEN, DATABASE_URL, CHANNEL_ID]):
-        logger.error("Критична помилка: Не задані BOT_TOKEN, DATABASE_URL або CHANNEL_ID.")
+    # 🚨 ПЕРЕВІРКА: Явна перевірка змінних середовища для діагностики помилки NoneType
+    if not BOT_TOKEN:
+        logger.critical("Критична помилка: TELEGRAM_BOT_TOKEN не задано. Перевірте змінні середовища Render.")
+        return
+    if not DATABASE_URL:
+        logger.critical("Критична помилка: DATABASE_URL не задано. Перевірте змінні середовища Render.")
+        return
+    if not CHANNEL_ID:
+        logger.critical("Критична помилка: TELEGRAM_CHANNEL_ID не задано. Перевірте змінні середовища Render.")
         return
 
     # 1. Підключення до бази даних
     await connect_db()
+    
+    # Вихід, якщо DB не підключилася
+    if not db_pool:
+        return
+
     await init_db()
 
     # 2. Налаштування та запуск бота
@@ -545,7 +570,8 @@ async def main():
         await dp.start_polling(bot)
     finally:
         # 5. Закриття сесій
-        await bot.session.close()
+        if bot:
+            await bot.session.close()
         if db_pool:
             await db_pool.close()
 
