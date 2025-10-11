@@ -36,9 +36,9 @@ except ValueError:
     ADMIN_ID = 0
 
 # Конфігурація бота
-POSTING_INTERVAL_MIN = 5  # Кожні 5 хвилин
-MAX_NEWS_PER_CYCLE = 5   # ⬅️ СТРОГИЙ ЛІМІТ: До 5 новин за цикл
-MAX_AGE_MIN = 20          # Не публікувати новини старше 20 хвилин
+POSTING_INTERVAL_MIN = 5  # ✅ Кожні 5 хвилин
+MAX_NEWS_PER_CYCLE = 2   # ✅ СТРОГИЙ ЛІМІТ: До 2 новин за цикл (ТОП-2)
+MAX_AGE_MIN = 30          # ✅ Не публікувати новини старше 30 хвилин (Обмеження по переглядах)
 
 # Додано User-Agent для обходу 403 помилок
 DEFAULT_HEADERS = {
@@ -47,7 +47,7 @@ DEFAULT_HEADERS = {
     'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
 }
 
-# 1. 📰 Джерела новин (ОНОВЛЕНО: Видалено нестабільні джерела з логів 404/403)
+# 1. 📰 Джерела новин 
 SOURCES = [
     "https://tsn.ua/rss/all.xml",
     "https://www.pravda.com.ua/rss/news/",
@@ -61,7 +61,7 @@ SOURCES = [
     "https://ua.korrespondent.net/rss/all",
     "https://gazeta.ua/rss/all",
     "https://24tv.ua/rss/all.xml",
-    "https://nv.ua/ukr/rss/all.xml", # Український фід NV
+    "https://nv.ua/ukr/rss/all.xml", 
     "https://delo.ua/rss/all.xml",
     "https://suspilne.media/feed/", 
     "https://www.bbc.com/ukrainian/rss.xml",
@@ -69,7 +69,7 @@ SOURCES = [
     "https://www.unian.ua/rss/news.rss", 
     "https://ua.interfax.com.ua/news/ukraine.rss", 
     "https://zaxid.net/rss",
-    "https://hromadske.ua/feed/news" # Перевірений фід Hromadske
+    "https://hromadske.ua/feed/news"
 ]
 FETCH_LIMIT = 15 
 
@@ -163,10 +163,12 @@ async def get_unique_news_from_db(limit: int) -> list:
         SELECT url, title, summary, image_url, source
         FROM news
         WHERE is_posted = FALSE
-        -- 💡 ОПТИМІЗАЦІЯ: Пріоритет новин з картинкою
+        -- 💡 Пріоритет (Імітація Топ-новин за переглядами):
+        -- 1. Новини з зображенням (зазвичай більш важливі/популярні).
+        -- 2. Новини за свіжістю (найбільш актуальні).
         ORDER BY 
-            (image_url IS NOT NULL AND image_url != '') DESC, -- Пріоритет для новин з валідним image_url
-            published_at DESC
+            (image_url IS NOT NULL AND image_url != '') DESC, 
+            published_at DESC 
         LIMIT $1;
     """
     async with db_pool.acquire() as conn:
@@ -207,11 +209,11 @@ def is_news_relevant(title: str, summary: str) -> bool:
     """Перевіряє, чи не стосується новина заблокованих тем (зірки, футбол)."""
     text = (title + " " + summary).lower()
     
-    # Ключові слова для блокування новин про зірок/шоу-бізнес
+    # Ключові слова для блокування новин про зірок/шоу-бізнес (включно з tsn.ua)
     celebrity_keywords = [
         "зірок", "зірка", "шоу-бізнес", "світське життя", "особисте життя", 
         "відпочинок", "вагітність", "розлучення", "скандал", "тсн.особливе",
-        "телебачення", "кіно", "мода", "гламур"
+        "телебачення", "кіно", "мода", "гламур", "новини зірок"
     ]
     
     # Ключові слова для блокування новин про футбол
@@ -276,7 +278,6 @@ def extract_image_url(entry) -> str:
         clean_url = image_url.split('?')[0].split('#')[0]
 
         # Строга перевірка на популярні розширення або формати даних
-        # Якщо URL не закінчується розширенням зображення, він буде відхилений, щоб уникнути помилки Bad Request
         if re.search(r'\.(jpe?g|png|gif|webp|tiff|svg|ico|bmp|tga|avif)\b|data:image\/', clean_url.lower()):
             return image_url
             
@@ -315,7 +316,8 @@ async def fetch_and_parse_source(session, rss_url: str):
 
     feed = feedparser.parse(content)
     now_kyiv = datetime.now(KYIV_TZ)
-    max_age_dt = timedelta(minutes=MAX_AGE_MIN)
+    # Обмеження віку новин до 30 хвилин (MAX_AGE_MIN)
+    max_age_dt = timedelta(minutes=MAX_AGE_MIN) 
 
     for entry in feed.entries[:FETCH_LIMIT]:
         try:
@@ -323,13 +325,14 @@ async def fetch_and_parse_source(session, rss_url: str):
             title = entry.title
             summary = normalize_summary(entry.get('summary') or entry.get('description') or entry.title)
             
-            # 💡 НОВИЙ ФІЛЬТР: Перевірка на нерелевантні теми
+            # 💡 ФІЛЬТР 1: Перевірка на нерелевантні теми (зірки, футбол)
             if not is_news_relevant(title, summary):
                 continue
 
             image_url = extract_image_url(entry)
             published_time = parse_published_time(entry, rss_url)
 
+            # 💡 ФІЛЬТР 2: Обмеження віку новини (30 хвилин)
             if now_kyiv - published_time > max_age_dt:
                 logger.debug(f"Пропущено стару новину: {title[:50]}... ({now_kyiv - published_time})")
                 continue
@@ -349,7 +352,7 @@ async def fetch_and_parse_source(session, rss_url: str):
     return news_items
 
 async def fetch_all_sources():
-    """Асинхронно отримує новини з випадково обраних джерел (для оптимізації Compute)."""
+    """Асинхронно отримує новини з випадково обраних джерел."""
     all_news = []
     start_time = asyncio.get_event_loop().time()
 
@@ -389,7 +392,7 @@ async def send_news_to_channel(news_to_post: list):
     """Публікує новини у канал, використовуючи метод send_photo або send_message."""
     
     posted_urls = []
-    # Публікуємо найновіші, з пріоритетом на картинки
+    # Публікуємо лише 2 новини (MAX_NEWS_PER_CYCLE)
     
     for news in news_to_post[:MAX_NEWS_PER_CYCLE]:
         try:
@@ -409,14 +412,13 @@ async def send_news_to_channel(news_to_post: list):
                     chat_id=CHANNEL_ID,
                     text=caption,
                     parse_mode=ParseMode.HTML,
-                    disable_web_page_preview=True # Вимикаємо прев'ю, щоб пости без фото виглядали уніфіковано
+                    disable_web_page_preview=True
                 )
             
-            await asyncio.sleep(1) # Невелика затримка для запобігання rate limit
+            await asyncio.sleep(1) 
             posted_urls.append(news['url'])
             
         except Exception as e:
-            # У разі помилки відправки (особливо з фото), ми НЕ позначаємо новину як опубліковану.
             logger.error(f"Помилка відправки новини '{news['title'][:50]}...': {e}")
             continue 
 
@@ -432,14 +434,15 @@ async def auto_posting_loop(bot: Bot):
             logger.info("--- Запуск циклу автопостингу ---")
             start_time = datetime.now()
             
+            # 1. Парсинг і збереження новин (з обмеженням віку до 30 хв)
             fetched_news = await fetch_all_sources()
-            
             new_count = await save_news_to_db(fetched_news)
             logger.info(f"Успішно вставлено (нових) {new_count} новин у базу.")
 
-            # Отримуємо новини, пріоритезуючи ті, що з картинками
+            # 2. Отримуємо 2 (MAX_NEWS_PER_CYCLE) найбільш пріоритетні новини
             news_to_post = await get_unique_news_from_db(MAX_NEWS_PER_CYCLE)
             
+            # 3. Публікація 
             posted_count = await send_news_to_channel(news_to_post)
             
             end_time = datetime.now()
@@ -462,8 +465,8 @@ async def cmd_status(message: types.Message):
     config_msg = (
         "<b>🤖 Статус Бота та Конфігурація:</b>\n\n"
         f"⏳ Інтервал: {POSTING_INTERVAL_MIN} хв\n"
-        f"⏱️ Макс. вік новини: {MAX_AGE_MIN} хв\n"
-        f"📝 Макс. постів за цикл: {MAX_NEWS_PER_CYCLE}\n"
+        f"⏱️ Макс. вік новини для парсингу: {MAX_AGE_MIN} хв (обмеження за переглядами)\n"
+        f"📝 Макс. постів за цикл: {MAX_NEWS_PER_CYCLE} <b>(ТОП-2)</b>\n"
         f"📰 Джерел у списку: {len(SOURCES)}\n"
         f"⚙️ Webhook: Вимкнено (Polling Mode)\n"
         f"🔑 Admin ID: <code>{ADMIN_ID}</code>\n"
@@ -480,7 +483,8 @@ async def cmd_forcepost(message: types.Message):
             start_time = datetime.now()
             fetched_news = await fetch_all_sources()
             new_count = await save_news_to_db(fetched_news)
-            news_to_post = await get_unique_news_from_db(MAX_NEWS_PER_CYCLE)
+            # Використовуємо MAX_NEWS_PER_CYCLE = 2
+            news_to_post = await get_unique_news_from_db(MAX_NEWS_PER_CYCLE) 
             posted_count = await send_news_to_channel(news_to_post)
             duration = (datetime.now() - start_time).total_seconds()
             
