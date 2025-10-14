@@ -60,7 +60,8 @@ class Config:
     
     # 🖼️ ПАРАМЕТРИ WATERMARK
     DEFAULT_WATERMARK = "@YourChannelName" 
-    DEFAULT_CTA = "👉 Підписатись на @YourChannelName" 
+    # ВИПРАВЛЕННЯ: Прибрано "підписатись"
+    DEFAULT_CTA = "👉 Більше новин у Telegram" 
     
     DEFAULT_HEADERS = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Bot/1.0', 
@@ -143,6 +144,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 try:
+    # ⚠️ ВАЖЛИВО: ADMIN_ID має бути ID вашого особистого облікового запису Telegram (число).
+    # Якщо тут помилка, ви будете бачити: "Bad Request: chat not found" у логах.
     ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 except ValueError:
     ADMIN_ID = 0
@@ -402,9 +405,9 @@ def is_news_relevant(title: str, summary: str) -> bool:
     irrelevant_keywords = [
         "зірок", "зірка", "шоу-бізнес", "світське життя", "особисте життя", 
         "вагітність", "розлучення", "скандал", "тсн.особливе", "телебачення", 
-        "кіно", "мода", "гламур", "голлівуд", "селебриті", # Зірки
-        "футбол", "матч", "ліга чемпіонів", "прем'єр-ліга", "динамо", "шахтар", "фк ", # Спорт
-        "гороскоп", "прогноз погоди", "рецепт", "порада", "кулінарія", "догляд", # Сміття
+        "кіно", "мода", "гламур", "голлівуд", "селебриті", 
+        "футбол", "матч", "ліга чемпіонів", "прем'єр-ліга", "динамо", "шахтар", "фк ", 
+        "гороскоп", "прогноз погоди", "рецепт", "порада", "кулінарія", "догляд", 
         "прикмета", "сонник"
     ]
     
@@ -418,6 +421,8 @@ def normalize_summary(text: str) -> str:
     """Очищає та нормалізує текст анотації."""
     if not text:
         return ""
+    # MarkupResemblesLocatorWarning тут не критична, але вказує, що текст виглядає як шлях до файлу.
+    # Оскільки ми парсимо HTML, 'html.parser' є правильним.
     soup = BeautifulSoup(text, 'html.parser')
     clean_text = soup.get_text()
     clean_text = ' '.join(clean_text.split())
@@ -425,7 +430,6 @@ def normalize_summary(text: str) -> str:
 
 def extract_image_url(entry):
     """Видобуває URL зображення з різних полів RSS/Atom запису."""
-    # ... (логіка видобування зображення)
     if hasattr(entry, 'media_content') and entry.media_content:
         for media in entry.media_content:
             if media.get('url') and 'image' in media.get('type', ''):
@@ -464,7 +468,7 @@ def parse_published_time(entry, rss_url: str):
         try:
             published_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).astimezone(KYIV_TZ)
         except Exception:
-            pass # Пропускаємо, якщо час не валідний
+            pass 
             
     if not published_time and hasattr(entry, 'updated_parsed'):
         try:
@@ -480,16 +484,27 @@ def parse_published_time(entry, rss_url: str):
     return published_time
 
 def generate_hashtags(title: str, summary: str) -> str:
-    """Генерує до 3-х релевантних хештегів на основі ключових слів."""
+    """
+    Генерує до 3-х релевантних багатослівних хештегів на основі ключових слів.
+    Телеграм розглядає увесь рядок після # до пробілу як один хештег.
+    """
     text = (title + " " + summary).lower()
     
+    # ВИПРАВЛЕННЯ: Багатослівні хештеги
     keyword_map = {
-        'війна': '#Війна', 'рф': '#Війна', 'росія': '#Війна', 'обстріл': '#Війна', 'фронт': '#Фронт',
-        'зеленський': '#Зеленський', 'президент': '#Політика', 'парламент': '#Політика', 'рада': '#Політика',
-        'долар': '#Фінанси', 'гривня': '#Фінанси', 'банк': '#Фінанси', 'економіка': '#Економіка', 'ціни': '#Економіка',
-        'єс': '#Європа', 'сша': '#США', 'україна': '#Україна', 'київ': '#Київ',
-        'суд': '#Право', 'кримінал': '#Право', 'поліція': '#Право', 'закон': '#Право',
-        'технології': '#Техно', 'наука': '#Наука', 'медицина': '#Медицина'
+        'війна': '#ВійнаВУкраїні', 'рф': '#РосійськаАгресія', 'росія': '#НовиниВійни', 
+        'обстріл': '#ФронтовіЗведення', 'фронт': '#СитуаціяНаФронті',
+        'зеленський': '#ЗаявиПрезидента', 'президент': '#УкраїнськаПолітика', 
+        'парламент': '#РішенняВерховноїРади', 'рада': '#ПолітичніНовини',
+        'долар': '#ВалютнийРинок', 'гривня': '#ФінансовіНовини', 
+        'банк': '#БанківськийСектор', 'економіка': '#ЕкономікаСвіту', 
+        'ціни': '#ЦіниВУкраїні', 'курс': '#КурсВалют',
+        'єс': '#ЄвропейськийСоюз', 'сша': '#МіжнародніВідносини', 
+        'україна': '#АктуальноВУкраїні', 'київ': '#НовиниСтолиці',
+        'суд': '#СудоваСистема', 'кримінал': '#КримінальніПодії', 
+        'поліція': '#ПравоохоронніОргани', 'закон': '#НовіЗакони',
+        'технології': '#СвітТехнологій', 'наука': '#УкраїнськаНаука', 
+        'медицина': '#МедичніНовини'
     }
     
     found_hashtags = set()
@@ -522,13 +537,11 @@ async def apply_watermark(image_url: str, text: str) -> BytesIO | None:
             async with session.get(image_url, headers=Config.DEFAULT_HEADERS, timeout=Config.HTTP_TIMEOUT) as response:
                 response.raise_for_status()
                 
-                # 🛡️ ПЕРЕВІРКА НАДІЙНОСТІ: Розмір файлу
                 content_length = response.content_length
                 if content_length and content_length > MAX_IMAGE_SIZE_BYTES:
                     logger.warning(f"❌ Зображення занадто велике ({content_length} байт). Пропущено Watermark.")
                     return None
                 
-                # 🛡️ ПЕРЕВІРКА НАДІЙНОСТІ: Тип контенту
                 content_type = response.headers.get('Content-Type', '').lower()
                 if not content_type.startswith('image/'):
                     logger.warning(f"❌ Очікувався image/*, отримано {content_type}. Пропущено Watermark.")
@@ -665,9 +678,6 @@ async def fetch_all_sources():
 def format_news_post(news_item: dict) -> str:
     """
     Форматує новину для публікації у Telegram (HTML).
-    
-    ВИПРАВЛЕНО: Прибрано час перед посиланням.
-    ВИПРАВЛЕНО: Додано гіперпосилання https://t.me/newsone234 до CTA.
     """
     source_display = news_item['source'].replace('https://', '').replace('http://', '')
     
@@ -680,10 +690,10 @@ def format_news_post(news_item: dict) -> str:
     message = (
         f"{emoji} <b>{news_item['title']}</b>\n\n"
         f"{news_item['summary']}\n\n"
-        # Час прибрано
+        # Час перед подробицями прибрано (виправлено у попередній ітерації)
         f"<a href='{news_item['url']}'>Подробиці на {source_display}</a>\n" 
         f"{hashtags}\n\n"
-        # CTA з гіперпосиланням
+        # CTA з гіперпосиланням (виправлено: прибрано "підписатись", додано гіперпосилання)
         f"<a href='{channel_link}'><i>{bot_state.cta_text}</i></a>"
     )
     return message
@@ -789,7 +799,7 @@ async def send_daily_digest():
         await bot.send_message(
             chat_id=CHANNEL_ID,
             text=digest_message,
-            parse_mode=ParseMode.MARKDOWN # Використовуємо Markdown для Дайджесту, щоб заголовок був жирним
+            parse_mode=ParseMode.MARKDOWN 
         )
         digest_urls = [news['url'] for news in news_list]
         await mark_news_as_posted(digest_urls, is_digested=True)
@@ -822,7 +832,6 @@ async def send_admin_notification(message: str, is_error: bool = False):
     try:
         await bot.send_message(ADMIN_ID, full_message, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        # Ваш лог містить: Bad Request: chat not found. Перевірте, чи ADMIN_ID вірний (це має бути ваш ID користувача, не канал)
         logger.error(f"Не вдалося надіслати сповіщення адміну: {e}")
 
 # --- 6. ОСНОВНИЙ ЦИКЛ АВТОПОСТИНГУ ---
@@ -843,7 +852,7 @@ async def auto_posting_loop(bot: Bot):
             await send_daily_digest()
         
         try:
-            # 2. Парсинг і збереження новин (використовуємо тут fetch_interval_min, хоча по факту це не впливає на posting_loop)
+            # 2. Парсинг і збереження новин
             fetched_news, parse_duration = await fetch_all_sources()
             new_count = await save_news_to_db(fetched_news)
 
@@ -856,7 +865,7 @@ async def auto_posting_loop(bot: Bot):
             post_duration = (datetime.now() - post_start_time).total_seconds()
             
             logger.info(
-                f"--- ✅ Цикл завершено. Постів: {posted_count}. Таймінги: Парсинг={parse_duration:.2f}с, Постинг={post_duration:.2f}с ---"
+                f"--- ✅ Цикл завершено. Нових: {new_count}. Постів: {posted_count}. Таймінги: Парсинг={parse_duration:.2f}с, Постинг={post_duration:.2f}с ---"
             )
             
         except Exception as e:
@@ -903,8 +912,6 @@ async def cmd_reboot(message: types.Message):
     """/reboot - Примусово перезавантажує динамічний стан з БД (перевірка персистенції)."""
     await message.answer("⚠️ Симуляція перезавантаження. Завантаження стану з БД...")
     
-    global bot_state
-    temp_bot_state = BotState() 
     await load_bot_state_from_db()
     
     await message.answer("✅ Динамічний стан успішно перезавантажено. Перевірте <code>/status</code>.", parse_mode=ParseMode.HTML)
@@ -967,7 +974,7 @@ async def cmd_set_cta(message: types.Message):
         await save_bot_state_to_db() 
         await message.answer(f"✅ Текст заклику до дії (CTA) змінено на: <i>{new_text}</i>", parse_mode=ParseMode.HTML)
     except IndexError:
-        await message.answer("❌ Використання: <code>/set_cta 👉 Підписатись на @MyChannel</code>", parse_mode=ParseMode.HTML)
+        await message.answer("❌ Використання: <code>/set_cta 👉 Більше новин у Telegram</code>", parse_mode=ParseMode.HTML)
         
 async def cmd_set_interval(message: types.Message):
     """/set_interval <постинг> - Змінює інтервал постингу (у хвилинах)."""
@@ -1069,7 +1076,7 @@ async def main():
         return
 
     await init_db()
-    await load_bot_state_from_db() # 💡 ЗАВАНТАЖЕННЯ ДИНАМІЧНОГО СТАНУ ПРИ СТАРТІ
+    await load_bot_state_from_db() 
 
     global bot
     bot = Bot(
@@ -1080,6 +1087,7 @@ async def main():
     global dp
     dp = Dispatcher()
     
+    # 💡 Покращення: Використовуємо один фільтр для всіх адмін-команд
     admin_filter = F.from_user.id == ADMIN_ID
     
     # Реєстрація команд адміністратора
@@ -1096,12 +1104,21 @@ async def main():
     dp.message.register(cmd_set_interval, Command("set_interval"), admin_filter)
     dp.message.register(cmd_toggle_source, Command("toggle_source"), admin_filter)
 
+    # 💡 Покращення: Агресивне вимкнення Webhook для уникнення TelegramConflictError
+    for i in range(5):
+        try:
+            await bot.delete_webhook(drop_pending_updates=True) 
+            logger.info("Webhook успішно вимкнено.")
+            break
+        except Exception as e:
+            logger.warning(f"Помилка вимкнення Webhook (Спроба {i+1}/5): {e}. Затримка 5 сек...")
+            await asyncio.sleep(5)
+
     asyncio.create_task(auto_posting_loop(bot))
     asyncio.create_task(db_cleanup_loop())
     logger.info("Бот запущено. Початок роботи.")
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True) 
         await dp.start_polling(bot)
     finally:
         if bot:
