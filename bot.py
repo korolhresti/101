@@ -4,26 +4,33 @@ import logging
 import re
 import random
 import sys
+import json
+import base64
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin
-from typing import List, Optional, Dict, Any
+from urllib.parse import urlparse, urljoin
+from typing import Dict, Any, List, Optional, Tuple
 
 import asyncpg
 import aiohttp
 from aiohttp import ClientSession, web
-from aiogram import Bot, Dispatcher, Router, types
+import feedparser
+from bs4 import BeautifulSoup
+
+from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import WebhookInfo, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-
+from aiogram.methods.set_webhook import SetWebhook
 
 # --- 1. НАЛАШТУВАННЯ СЕРЕДОВИЩА ТА ЛОГУВАННЯ ---
 
+# Встановлюємо часовий пояс для коректної роботи з часом новин
 KYIV_TZ = timezone(timedelta(hours=3), 'Europe/Kyiv')
 
+# Налаштування логування
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
                     stream=sys.stdout)
@@ -32,620 +39,726 @@ logger = logging.getLogger(__name__)
 # Змінні оточення
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+# Використовуємо GEMINI_API_KEY для генерації хештегів
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") 
 
-# Webhook конфігурація
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
-WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0") 
+# Нові змінні для Webhook
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST") # Ваш публічний домен (обов'язково HTTPS)
+WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
 WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
 
-if BOT_TOKEN:
-    WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-    # Використовуємо WEBHOOK_HOST, який повинен бути публічним HTTPS-доменом
-    WEBHOOK_URL = urljoin(WEBHOOK_HOST or "https://placeholder-host.com/", WEBHOOK_PATH)
-else:
-     WEBHOOK_PATH = "/webhook/placeholder"
-     WEBHOOK_URL = ""
+# Секретний токен для URL вебхука
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "super-secret-key")
 
-# Константи для preferred стилів
-EXPERT_POLITICAL = "portnikov"
-EXPERT_ECONOMIC = "libsits"
-EXPERT_MIXED = "mixed"
+# Формування повного URL для вебхука
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}"
 
+# --- 2. КОНФІГУРАЦІЯ БОТА ---
 
-# --- 2. МОДУЛЬ АНАЛІТИКИ: MOCK ECONOMIC ENGINE ---
-
-class EconomicEngine:
-    """Мок-клас для симуляції доступу до економічних даних або API."""
+class Config:
+    """Конфігурація платформи, зібрана в одному місці."""
     
-    def __init__(self, pool: asyncpg.Pool):
-        self.pool = pool
-        # Імітація актуальних економічних показників
-        self.mock_data = {
-            "gdp_growth": "Попередній квартал: +0.8%; Прогноз: +1.2%",
-            "inflation": "Поточний рівень: 8.5%; Ціль НБУ: 5%",
-            "bond_yields": "ОВДП (1 рік): 18.5%",
-            "currency_rate": "Офіційний курс НБУ: 40.5 UAH/USD"
-        }
-
-    async def get_latest_report(self) -> Dict[str, str]:
-        """Симулює отримання актуальних економічних даних."""
-        # У професійній версії тут був би виклик API чи DB
-        await asyncio.sleep(0.1) # Імітація затримки
-        return self.mock_data
-        
-    async def get_report_summary(self, style: str) -> str:
-        """Створює короткий звіт у заданому стилі на основі мок-даних."""
-        data = await self.get_latest_report()
-        # Форматуємо дані для вставки в prompt (екранування для MarkdownV2 відбувається пізніше)
-        summary = (
-            f"Останні економічні показники:\n"
-            f"Зростання ВВП: {data['gdp_growth']}\n"
-            f"Інфляція: {data['inflation']}\n"
-            f"Дохідність держоблігацій: {data['bond_yields']}\n"
-            f"Курс НБУ: {data['currency_rate']}\n"
-        )
-        return summary
-
-
-# --- 3. СТРУКТУРА БАЗИ ДАНИХ ТА FSM СТАНИ ---
-
-async def create_db_tables(pool: asyncpg.Pool):
-    """Створює необхідні таблиці в базі даних. Додано expert_preference та last_active."""
-    await pool.execute("""
-        CREATE TABLE IF NOT EXISTS subscribers (
-            chat_id BIGINT PRIMARY KEY,
-            subscribed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-            expert_preference TEXT DEFAULT 'mixed' NOT NULL,
-            last_active TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-        );
-    """)
-
-class NewsChat(StatesGroup):
-    """Стани для керування багатоходовим діалоговим режимом з експертом-ШІ."""
-    waiting_for_question = State() # Очікування питання від користувача
-
-
-# --- 4. MIDDLEWARE ДЛЯ ПРОФЕСІЙНОЇ ПЛАТФОРМИ ---
-
-# Middleware для оновлення часу останньої активності користувача
-async def update_last_active_middleware(handler, event: types.Update, data: dict):
-    """Оновлює поле last_active у DB для кожного вхідного повідомлення."""
-    pool = data.get('pool')
+    # ⚙️ ОСНОВНІ ПАРАМЕТРИ ЦИКЛУ (ОНОВЛЕНО)
+    NEWS_FETCH_INTERVAL_MIN = 20 # Кожні 20 хвилин - ШУКАЄМО ТОП-НОВИНИ
+    NEWS_POST_INTERVAL_MIN = 5   # Кожні 5 хвилин - ПОСТИМО НОВИНИ З ЧЕРГИ
+    MAX_NEWS_PER_CYCLE = 3       # СТРОГИЙ ЛІМІТ: До 3 новин за цикл (ТОП-3)
+    MAX_AGE_MIN = 30             # Не публікувати новини старше 30 хвилин
     
-    # Визначаємо chat_id для повідомлень, callback_query тощо
-    chat_id = event.message.chat.id if event.message else (
-        event.callback_query.message.chat.id if event.callback_query and event.callback_query.message else None
-    )
+    # 🛡️ ПАРАМЕТРИ НАДІЙНОСТІ ТА ПРОДУКТИВНОСТІ
+    FETCH_LIMIT = 30             # Макс. кількість записів для аналізу в кожному RSS-фіді
+    NUM_SOURCES_TO_FETCH = 20    # Кількість випадкових джерел, які будуть перевірені за цикл
+    HTTP_TIMEOUT = 15            # Таймаут HTTP-запиту в секундах
+    MAX_CONCURRENCY = 15         # Макс. кількість одночасних HTTP-з'єднань
+    
+    # 💾 ПАРАМЕТРИ ОБСЛУГОВУВАННЯ БАЗИ ДАНИХ
+    DB_CLEANUP_DAYS = 7          # Видаляти новини, старші за 7 днів
+    CLEANUP_INTERVAL_HOURS = 1   # Інтервал очищення (кожна година)
+    
+    DEFAULT_HEADERS = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36', 
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
+    }
 
-    if pool and chat_id:
-        try:
-             await pool.execute(
-                "UPDATE subscribers SET last_active = NOW() WHERE chat_id = $1",
-                chat_id
-            )
-        except Exception as e:
-            logger.debug(f"Помилка оновлення last_active для {chat_id}: {e}")
-            
-    return await handler(event, data)
-
-
-# --- 5. ХЕНДЛЕРИ БОТА ТА ІНТЕРАКТИВНІСТЬ ---
-
-# ВИПРАВЛЕННЯ: Створюємо інстанс Router() безпосередньо.
-router = Router() 
-router.message.middleware.register(update_last_active_middleware)
-router.callback_query.middleware.register(update_last_active_middleware)
-
-
-def get_preference_keyboard() -> InlineKeyboardMarkup:
-    """Створює інлайн-клавіатуру для вибору preferred стилю новин."""
-    buttons = [
-        [
-            InlineKeyboardButton(text="📰 Політика (Портников)", callback_data=f"set_expert_{EXPERT_POLITICAL}"),
-        ],
-        [
-            InlineKeyboardButton(text="📈 Економіка (Лібсіц)", callback_data=f"set_expert_{EXPERT_ECONOMIC}"),
-        ],
-        [
-            InlineKeyboardButton(text="⚖️ Змішаний (Рандом)", callback_data=f"set_expert_{EXPERT_MIXED}"),
-        ]
+    # 1. 📰 Джерела новин 
+    SOURCES = [
+        "https://tsn.ua/rss/all.xml", "https://www.pravda.com.ua/rss/news/", 
+        "https://censor.net/rss/all_news", "https://www.rbc.ua/static/rss/all.xml",
+        "https://www.ukrinform.ua/rss/all.xml", "https://www.liga.net/rss/news.xml",
+        "https://www.obozrevatel.com/rss/main.xml", "https://minfin.com.ua/rss/news/",
+        "https://focus.ua/rss/latest.xml", "https://ua.korrespondent.net/rss/all",
+        "https://gazeta.ua/rss/all", "https://24tv.ua/rss/all.xml",
+        "https://nv.ua/ukr/rss/all.xml", "https://delo.ua/rss/all.xml",
+        "https://suspilne.media/feed/", "https://www.bbc.com/ukrainian/rss.xml",
+        "https://news.finance.ua/ua/rss", "https://www.unian.ua/rss/news.rss", 
+        "https://ua.interfax.com.ua/news/ukraine.rss", "https://zaxid.net/rss",
+        "https://hromadske.ua/feed/news", "https://biz.censor.net/rss"
     ]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-async def get_user_preference(pool: asyncpg.Pool, chat_id: int) -> Optional[str]:
-    """Отримує preferred стиль новин користувача."""
-    preference = await pool.fetchval(
-        "SELECT expert_preference FROM subscribers WHERE chat_id = $1", 
-        chat_id
-    )
-    return preference
+# --- 3. ФУНКЦІЇ ДЛЯ РОБОТИ З БАЗОЮ ДАНИХ ---
 
-@router.message(Command("start"))
-async def command_start_handler(message: types.Message, pool: asyncpg.Pool) -> None:
-    """Обробляє команду /start, реєструє користувача та пропонує обрати preferred стиль."""
-    chat_id = message.chat.id
+async def setup_db_schema(pool: asyncpg.Pool):
+    """Створення необхідних таблиць та перевірка схеми."""
+    async with pool.acquire() as conn:
+        # Таблиця для підписників
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscribers (
+                id SERIAL PRIMARY KEY,
+                chat_id BIGINT UNIQUE NOT NULL,
+                subscribed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        # Таблиця для черги новин (must_post=true) та вже опублікованих
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS news_articles (
+                id SERIAL PRIMARY KEY,
+                link TEXT UNIQUE NOT NULL,
+                title TEXT,
+                summary TEXT,
+                image_url TEXT,
+                published_time TIMESTAMP WITH TIME ZONE,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                is_posted BOOLEAN DEFAULT FALSE,
+                posted_at TIMESTAMP WITH TIME ZONE NULL
+            );
+        """)
+    logger.info("Таблиці 'subscribers' та 'news_articles' перевірені/створені.")
+
+async def is_article_exists(pool: asyncpg.Pool, link: str) -> bool:
+    """Перевіряє, чи існує стаття з цим посиланням у БД."""
+    async with pool.acquire() as conn:
+        count = await conn.fetchval(
+            "SELECT count(*) FROM news_articles WHERE link = $1", link
+        )
+        return count > 0
+
+async def store_article(pool: asyncpg.Pool, article_data: Dict[str, Any]):
+    """Зберігає нову статтю в БД."""
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO news_articles (link, title, summary, image_url, published_time)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (link) DO NOTHING
+        """,
+            article_data['link'],
+            article_data['title'],
+            article_data['summary'],
+            article_data['image_url'],
+            article_data['published_time']
+        )
+    logger.debug(f"Збережено статтю: {article_data['title']}")
+
+# --- 4. ФУНКЦІЇ ДЛЯ СКРАПІНГУ ТА ПАРСИНГУ ---
+
+def parse_date(date_str: str) -> Optional[datetime]:
+    """Парсить дату з RSS та перетворює її на datetime з часовим поясом Києва."""
     try:
-        # Вставка або оновлення реєстрації
-        await pool.execute(
-            "INSERT INTO subscribers (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING",
-            chat_id
-        )
-        await message.answer(
-            "**👋 Ласкаво просимо до Професійної Аналітики!**\n\n"
-            "Ви можете миттєво генерувати аналітику та ставити питання експерту\\-ШІ\\.\n"
-            "Оберіть ваш preferred стиль аналітики:",
-            reply_markup=get_preference_keyboard(),
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
+        # feedparser повертає дату як time.struct_time, перетворюємо її
+        dt = datetime.fromtimestamp(feedparser._time_parse(date_str), tz=KYIV_TZ)
+        return dt
     except Exception as e:
-        logger.error(f"Помилка реєстрації користувача {chat_id}: {e}")
-        await message.answer("❌ Виникла помилка при реєстрації\\. Спробуйте пізніше\\.", parse_mode=ParseMode.MARKDOWN_V2)
-
-@router.message(Command("settings"))
-async def command_settings_handler(message: types.Message) -> None:
-    """Дозволяє користувачу змінити свій preferred стиль."""
-    await message.answer(
-        "**⚙️ Налаштування Експерта**\n\n"
-        "Оберіть preferred стиль новин для миттєвих запитів \\(/news, /ask\\):",
-        reply_markup=get_preference_keyboard(),
-        parse_mode=ParseMode.MARKDOWN_V2
-    )
-
-
-@router.callback_query(lambda c: c.data and c.data.startswith('set_expert_'))
-async def process_expert_choice(callback_query: types.CallbackQuery, pool: asyncpg.Pool):
-    """Обробляє вибір preferred стилю новин користувачем через інлайн-клавіатуру."""
-    chat_id = callback_query.message.chat.id
-    preference = callback_query.data.split('_')[-1] 
-    
-    preference_map = {
-        EXPERT_POLITICAL: "Політика (Портников)",
-        EXPERT_ECONOMIC: "Економіка (Лібсіц)",
-        EXPERT_MIXED: "Змішаний (Рандом)"
-    }
-    preference_title = preference_map.get(preference, preference.capitalize())
-    
-    try:
-        # Оновлення preference та часу останньої активності
-        await pool.execute(
-            "UPDATE subscribers SET expert_preference = $1, last_active = NOW() WHERE chat_id = $2",
-            preference,
-            chat_id
-        )
-        await callback_query.answer(f"Ваш preferred стиль встановлено: {preference_title}")
-        
-        # Редагуємо повідомлення, щоб прибрати клавіатуру і показати результат
-        await callback_query.message.edit_text(
-            f"✅ Налаштування оновлено\\. Ваш preferred стиль: **{preference_title}**\\.",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    except Exception as e:
-        logger.error(f"Помилка оновлення preferred користувача {chat_id}: {e}")
-        await callback_query.answer("❌ Виникла помилка\\. Спробуйте пізніше\\.", show_alert=True)
-
-
-@router.message(Command("news"))
-async def command_news_handler(message: types.Message, pool: asyncpg.Pool, bot: Bot, session: ClientSession, economic_engine: 'EconomicEngine'):
-    """Обробляє команду /news та генерує новину негайно, використовуючи preferred користувача."""
-    chat_id = message.chat.id
-    
-    preference = await get_user_preference(pool, chat_id)
-    if not preference:
-        await message.answer("Ви не зареєстровані або не обрали preferred стиль\\. Виконайте команду /start\\.", parse_mode=ParseMode.MARKDOWN_V2)
-        return
-
-    await bot.send_chat_action(chat_id, "typing")
-    await message.answer(f"🔄 **Генерую аналітику ({preference.capitalize()})**\\.\\.\\.", parse_mode=ParseMode.MARKDOWN_V2)
-
-    try:
-        # Передаємо глобальну aiohttp сесію та economic_engine
-        news_message = await generate_expert_news(session, economic_engine, preference) 
-        
-        if news_message:
-            await message.answer(news_message, parse_mode=ParseMode.MARKDOWN_V2)
-        else:
-            await message.answer("❌ Не вдалося згенерувати аналітику\\. Спробуйте пізніше або перевірте API ключ\\.", parse_mode=ParseMode.MARKDOWN_V2)
-            
-    except Exception as e:
-        logger.error(f"Помилка обробки /news для {chat_id}: {e}")
-        await message.answer("❌ Виникла критична помилка під час генерації\\. Спробуйте пізніше\\.", parse_mode=ParseMode.MARKDOWN_V2)
-
-@router.message(Command("ask"))
-async def command_ask_handler(message: types.Message, state: FSMContext, pool: asyncpg.Pool):
-    """Розпочинає багатоходовий діалоговий режим Q&A з експертом-ШІ."""
-    chat_id = message.chat.id
-    preference = await get_user_preference(pool, chat_id)
-    
-    if not preference:
-        await message.answer("Ви не зареєстровані\\. Виконайте команду /start, щоб розпочати.", parse_mode=ParseMode.MARKDOWN_V2)
-        return
-    
-    # Скидаємо будь-яку стару історію, щоб почати нову консультацію
-    await state.set_data({'chat_history': []})
-
-    expert_title = f"Експерт ({preference.capitalize()})"
-    
-    await message.answer(
-        f"**🎙️ Консультація з {expert_title}**\n\n"
-        "Задайте ваше перше питання\\. Це **багатоходовий діалог**, тому ви можете ставити додаткові питання, і експерт пам'ятатиме контекст\\.\n\n"
-        "Надішліть питання, або /cancel, щоб вийти з режиму консультації\\.",
-        parse_mode=ParseMode.MARKDOWN_V2
-    )
-    # Встановлюємо FSM стан
-    await state.set_state(NewsChat.waiting_for_question)
-
-
-@router.message(NewsChat.waiting_for_question)
-async def process_expert_question(message: types.Message, state: FSMContext, pool: asyncpg.Pool, bot: Bot, session: ClientSession):
-    """Обробляє питання користувача в багатоходовому діалоговому режимі."""
-    user_question = message.text
-    chat_id = message.chat.id
-    
-    # 0. Перевірка на /cancel
-    if user_question.lower() == "/cancel":
-        await state.clear()
-        await message.answer("✅ **Консультацію скасовано**\\. Щоб розпочати нову, використайте команду /ask\\.", parse_mode=ParseMode.MARKDOWN_V2)
-        return
-
-    # 1. Отримання preferred стилю та історії
-    preference = await get_user_preference(pool, chat_id)
-    state_data = await state.get_data()
-    
-    # Історія чату: list of {'role': 'user'/'model', 'parts': [{'text': '...'}]}
-    chat_history: List[Dict[str, Any]] = state_data.get('chat_history', [])
-    
-    # 2. Визначення system_prompt (надсилаємо завжди для стійкості)
-    system_prompt = "Ви — експерт-аналітик. Дайте чітку, стислу відповідь на питання користувача. Ваш тон і стиль мають відповідати обраному профілю. Використовуйте **MarkdownV2** для форматування. Відповідь має бути лише текстом, без заголовків."
-    if preference == EXPERT_POLITICAL:
-        system_prompt += " (Політичний оглядач, стиль Портникова: глибокий, геополітичний, прогнозуючий)."
-    elif preference == EXPERT_ECONOMIC:
-        system_prompt += " (Економічний експерт, стиль Лібсіца: прагматичний, критичний, з даними)."
-    else:
-        system_prompt += " (Змішаний, збалансований аналіз)."
-
-    # 3. Додаємо нове питання користувача до історії
-    new_user_message = {
-        "role": "user",
-        "parts": [{ "text": user_question }]
-    }
-    # Для API-дзвінка ми використовуємо поточну історію + нове повідомлення користувача
-    contents_for_api = chat_history + [new_user_message] 
-
-    await bot.send_chat_action(chat_id, "typing")
-    await message.answer("🤔 **Обмірковую відповідь\\.\\.\\.**", parse_mode=ParseMode.MARKDOWN_V2)
-
-    # 4. Виклик Gemini API з повною історією
-    response_text = await call_gemini_api(session, contents_for_api, system_prompt)
-    
-    if response_text:
-        # 5. Надсилаємо відповідь
-        await message.answer(
-            f"**Відповідь Експерта ({preference.capitalize()})**:\n\n"
-            f"{response_text}",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-        
-        # 6. Додаємо відповідь моделі до історії для наступного запиту
-        # Для коректної історії чату, ми повинні додати повідомлення користувача і відповідь моделі
-        chat_history.append(new_user_message)
-        
-        # Важливо: Gemini API повертає text з джерелами. Для історії чату ми зберігаємо лише текст моделі.
-        # Регулярний вираз для видалення джерел (тексту після "***")
-        model_text_only = re.split(r'\*\*\*|Джерела', response_text, maxsplit=1)[0].strip()
-        new_model_response = {
-            "role": "model",
-            "parts": [{ "text": model_text_only }]
-        }
-        chat_history.append(new_model_response)
-        
-        # 7. Зберігаємо оновлену історію в FSM контексті
-        await state.update_data(chat_history=chat_history)
-        
-        await message.answer(
-            "Продовжуйте консультацію або використайте /cancel, щоб завершити\\.",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-        # Стан NewsChat.waiting_for_question залишається активним
-
-    else:
-        # 8. Обробка помилки
-        await message.answer("❌ Вибачте, сталася помилка під час генерації відповіді\\. Історію чату збережено\\. Спробуйте інше питання або /cancel\\.", parse_mode=ParseMode.MARKDOWN_V2)
-
-
-@router.message(Command("cancel"))
-async def command_cancel_handler(message: types.Message, state: FSMContext):
-    """Скасовує будь-яку поточну FSM операцію."""
-    current_state = await state.get_state()
-    if current_state is None:
-        await message.answer("Немає активних операцій для скасування.")
-        return
-    
-    await state.clear()
-    await message.answer("Операцію скасовано\\. Я знову готовий до роботи\\.", parse_mode=ParseMode.MARKDOWN_V2)
-
-
-@router.message(Command("help"))
-async def command_help_handler(message: types.Message) -> None:
-    """Обробляє команду /help та надає довідку про функціонал."""
-    help_text = (
-        "**🤖 Професійна Аналітика — Ваш Експертний Бот**\n\n"
-        "Цей бот надає глибоку аналітику, змодельовану на основі стилів відомих експертів \\(Портников/Лібсіц\\) із залученням актуальних даних \\(Google Search Grounding\\) та економічних показників\\.\n\n"
-        "**Доступні команди:**\n"
-        "• `/start` \\- Розпочати роботу та обрати preferred стиль.\n"
-        "• `/news` \\- Отримати свіжу аналітику негайно \\(відповідно до вашого preferred стилю та останніх економічних даних\\).\n"
-        "• `/settings` \\- Змінити ваш preferred стиль новин.\n"
-        "• `/ask` \\- Розпочати багатоходову консультацію з експертом \\(діалог з пам'яттю контексту\\).\n"
-        "• `/help` \\- Показати цю довідку.\n"
-        "• `/cancel` \\- Скасувати поточну операцію \\(наприклад, під час `/ask`\\)."
-    )
-    # Екрануємо символи для MarkdownV2
-    help_text = re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', help_text)
-    await message.answer(help_text, parse_mode=ParseMode.MARKDOWN_V2)
-
-
-@router.message(Command("stats"))
-async def command_stats_handler(message: types.Message, pool: asyncpg.Pool) -> None:
-    """Обробляє команду /stats (для адміна) та показує статистику зареєстрованих користувачів."""
-    chat_id = message.chat.id
-    
-    if chat_id != ADMIN_ID:
-        await message.answer("Ця команда доступна лише адміністратору.")
-        return
-
-    try:
-        count = await pool.fetchval("SELECT COUNT(*) FROM subscribers")
-        # Активні - ті, хто взаємодіяв за останні 7 днів
-        active_count = await pool.fetchval(
-            "SELECT COUNT(*) FROM subscribers WHERE last_active >= NOW() - INTERVAL '7 days'"
-        )
-        
-        await message.answer(
-            f"\\*\\*📊 Статистика Платформи\\*\\*\n"
-            f"Всього зареєстрованих користувачів: `{count}`\n"
-            f"Активних за 7 днів: `{active_count}`",
-            parse_mode=ParseMode.MARKDOWN_V2
-        )
-    except Exception as e:
-        logger.error(f"Помилка отримання статистики: {e}")
-        await message.answer("Виникла помилка при отриманні статистики.")
-
-
-# --- 6. ФУНКЦІЇ ДЛЯ ГЕНЕРАЦІЇ НОВИН (GEMINI API) ---
-
-async def call_gemini_api(session: ClientSession, contents_list: List[Dict[str, Any]], system_prompt: Optional[str] = None) -> Optional[str]:
-    """
-    Викликає Gemini API з експоненційним відступом та Google Search grounding,
-    використовуючи повну історію чату.
-    """
-    if not GEMINI_API_KEY:
-        logger.warning("GEMINI_API_KEY не встановлено. Новини/відповіді не генеруються.")
+        logger.warning(f"Неможливо розпізнати дату '{date_str}': {e}")
         return None
 
-    model_name = "gemini-2.5-flash-preview-05-20" 
-    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GEMINI_API_KEY}"
+def find_image_url(soup: BeautifulSoup, base_url: str) -> Optional[str]:
+    """Шукає посилання на зображення в HTML за мета-тегами."""
     
+    # 1. Шукаємо OpenGraph та Twitter Card мета-теги
+    for prop in ['og:image', 'twitter:image']:
+        meta = soup.find('meta', property=prop)
+        if meta and meta.get('content'):
+            img_url = urljoin(base_url, meta['content'])
+            if img_url:
+                return img_url
+    
+    # 2. Якщо не знайдено, шукаємо перше велике зображення в body
+    # Це менш надійно, але може спрацювати.
+    body = soup.find('body')
+    if body:
+        img_tag = body.find('img', {'loading': 'lazy'}) or body.find('img')
+        if img_tag and img_tag.get('src'):
+            # Спробуємо відфільтрувати маленькі зображення (наприклад, іконки)
+            width = img_tag.get('width')
+            height = img_tag.get('height')
+            if width and height and int(width) < 200 and int(height) < 200:
+                return None
+            
+            img_url = urljoin(base_url, img_tag['src'])
+            # Проста перевірка, що URL не є іконкою
+            if not any(ext in img_url.lower() for ext in ['.ico', 'logo', 'icon', 'sprite']):
+                return img_url
+            
+    return None
+
+def find_summary_text(soup: BeautifulSoup) -> Optional[str]:
+    """Шукає детальний опис (summary) за мета-тегами."""
+    
+    # 1. OpenGraph та стандартний description
+    for prop in ['og:description', 'description']:
+        meta = soup.find('meta', property=prop) or soup.find('meta', attrs={'name': prop})
+        if meta and meta.get('content') and len(meta['content']) > 50:
+            return meta['content']
+            
+    return None
+
+async def fetch_page_metadata(link: str, session: ClientSession) -> Tuple[Optional[str], Optional[str]]:
+    """Завантажує сторінку статті та скрапить URL зображення та опис."""
+    image_url = None
+    summary = None
+    
+    try:
+        async with session.get(link, timeout=Config.HTTP_TIMEOUT) as response:
+            # Перевіряємо, що ми отримали HTML (або імітуємо його)
+            if 'text/html' not in response.headers.get('Content-Type', ''):
+                 logger.debug(f"URL {link} не повернув HTML.")
+                 return None, None
+            
+            html = await response.text()
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Шукаємо зображення
+            image_url = find_image_url(soup, link)
+            
+            # Шукаємо кращий опис
+            summary = find_summary_text(soup)
+
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning(f"Помилка завантаження сторінки {link}: {e}")
+    except Exception as e:
+        logger.error(f"Непередбачувана помилка при скрапінгу {link}: {e}", exc_info=True)
+        
+    return image_url, summary
+
+async def fetch_feed(url: str, pool: asyncpg.Pool, session: ClientSession):
+    """Завантажує, парсить та обробляє один RSS-фід."""
+    try:
+        async with session.get(url, timeout=Config.HTTP_TIMEOUT) as response:
+            content = await response.text()
+            feed = feedparser.parse(content)
+            
+            source_domain = urlparse(url).netloc
+            new_articles_count = 0
+
+            for entry in feed.entries[:Config.FETCH_LIMIT]:
+                link = entry.get('link')
+                if not link:
+                    continue
+                
+                # 1. Перевірка дублікатів у БД
+                if await is_article_exists(pool, link):
+                    logger.debug(f"Пропущено дублікат: {link}")
+                    continue
+
+                # 2. Перевірка віку
+                published_time_str = entry.get('published')
+                published_dt = parse_date(published_time_str)
+                
+                if published_dt is None:
+                    # Якщо дату не можна визначити, вважаємо, що стаття стара, або пропускаємо
+                    logger.debug(f"Пропущено статтю без дати: {link}")
+                    continue
+                
+                age_minutes = (datetime.now(KYIV_TZ) - published_dt).total_seconds() / 60
+                
+                if age_minutes > Config.MAX_AGE_MIN:
+                    logger.debug(f"Пропущено стару статтю ({age_minutes:.0f} хв): {link}")
+                    continue
+                
+                # 3. Скрапінг для пошуку фото та кращого опису
+                article_title = entry.get('title', 'Без заголовка')
+                
+                # Використовуємо summary з RSS як fallback
+                rss_summary = BeautifulSoup(entry.get('summary', ''), 'html.parser').get_text().strip()[:500] 
+                
+                image_url, scraped_summary = await fetch_page_metadata(link, session)
+                
+                # 4. Формування даних та збереження
+                article_data = {
+                    'link': link,
+                    'title': article_title,
+                    'summary': scraped_summary if scraped_summary else rss_summary,
+                    'image_url': image_url,
+                    'published_time': published_dt,
+                }
+                
+                if image_url:
+                    await store_article(pool, article_data)
+                    new_articles_count += 1
+                else:
+                    # Пропускаємо статті без зображень, як вимагає користувач ("обов'язково з фото")
+                    logger.debug(f"Пропущено статтю без фото: {link}")
+
+            logger.info(f"Оброблено фід {source_domain}. Додано нових статей з фото: {new_articles_count}")
+
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        logger.warning(f"Помилка завантаження RSS-фіду {url}: {e}")
+    except Exception as e:
+        logger.error(f"Критична помилка при обробці фіду {url}: {e}", exc_info=True)
+
+
+async def fetch_and_store_new_articles(pool: asyncpg.Pool, session: ClientSession):
+    """
+    Асинхронно завантажує нові статті з RSS-джерел.
+    """
+    logger.info("Початок процесу пошуку та зберігання нових статей.")
+    
+    # 1. Вибираємо випадкові джерела
+    sources_to_fetch = random.sample(Config.SOURCES, min(Config.NUM_SOURCES_TO_FETCH, len(Config.SOURCES)))
+    
+    # 2. Обмежуємо одночасні запити
+    semaphore = asyncio.Semaphore(Config.MAX_CONCURRENCY)
+    
+    async def limited_fetch(url):
+        async with semaphore:
+            await fetch_feed(url, pool, session)
+
+    # 3. Запускаємо паралельне завантаження
+    tasks = [limited_fetch(url) for url in sources_to_fetch]
+    
+    await asyncio.gather(*tasks)
+    
+    logger.info("Пошук нових статей завершено.")
+
+# --- 4.5. ФУНКЦІЯ ГЕНЕРАЦІЇ ХЕШТЕГІВ ЗА ДОПОМОГОЮ GEMINI API ---
+
+async def extract_hashtags_with_gemini(title: str, summary: str, session: ClientSession) -> List[str]:
+    """
+    Використовує Gemini API для виділення ключових осіб та місць
+    зі статті та генерує відповідні хештеги.
+    """
+    # Хоча GEMINI_API_KEY може бути порожнім, в Canvas він зазвичай вводиться під час виконання.
+    if not GEMINI_API_KEY and not os.getenv("GEMINI_API_KEY"):
+        logger.warning("GEMINI_API_KEY не знайдено. Пропускаю генерацію хештегів.")
+        return []
+
+    logger.debug("Запит до Gemini API для генерації хештегів...")
+    
+    # 1. API Конфігурація
+    api_key = GEMINI_API_KEY
+    api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent?key={api_key}"
+    
+    # 2. Системна інструкція та запит
+    system_prompt = (
+        "Ти — експерт з аналізу новин. Твоє завдання — виділити ключові іменовані сутності "
+        "(особи, організації, значущі місця, геополітичні події) з наданого тексту та повернути їх "
+        "як список хештегів. Максимум 5 хештегів. "
+        "Хештеги мають бути багатослівними, без пробілів, у форматі CamelCase (наприклад, 'ВолодимирЗеленський', 'КиївськаОбласть'). "
+        "Повертай результат виключно у форматі JSON відповідно до наданої схеми."
+    )
+    user_query = f"Проаналізуй наступний заголовок та опис для новинного посту та поверни до 5 найважливіших хештегів, що відповідають ключовим особам та місцям:\n\nЗаголовок: \"{title}\"\nОпис: \"{summary}\""
+
+    # 3. JSON Схема
+    response_schema = {
+        "type": "OBJECT",
+        "properties": {
+            "hashtags": {
+                "type": "ARRAY",
+                "description": "List of key entities (people, organizations, locations) extracted from the text, formatted as multi-word hashtags (e.g., 'ВолодимирЗеленський', 'КиївськаОбласть'). Maximum 5 hashtags.",
+                "items": { "type": "STRING" }
+            }
+        },
+        "required": ["hashtags"]
+    }
+
     payload = {
-        "contents": contents_list,
-        "tools": [{ "google_search": {} }], 
+        "contents": [{ "parts": [{ "text": user_query }] }],
+        "systemInstruction": { "parts": [{ "text": system_prompt }] },
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": response_schema
+        }
     }
     
-    if system_prompt:
-        payload["systemInstruction"] = { "parts": [{ "text": system_prompt }] }
-
-    max_retries = 5
-    base_delay = 1
-
-    for attempt in range(max_retries):
+    retries = 3
+    delay = 1.0
+    
+    for attempt in range(retries):
         try:
-            # Використовуємо передану сесію
-            async with session.post(api_url, json=payload, timeout=45) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    candidate = result.get('candidates', [{}])[0]
-                    text = candidate.get('content', {}).get('parts', [{}])[0].get('text')
-                    
-                    if not text:
-                         return "Вибачте, експерт не зміг сформувати відповідь. Спробуйте інше питання."
-                        
-                    sources_list = []
-                    grounding_metadata = candidate.get('groundingMetadata')
-                    if grounding_metadata and grounding_metadata.get('groundingAttributions'):
-                        # Форматуємо посилання, екрануючи заголовок для MarkdownV2
-                        sources_list = [
-                            f"[{re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', attr['web']['title'])}]({attr['web']['uri']})"
-                            for attr in grounding_metadata['groundingAttributions']
-                            if attr.get('web', {}).get('uri') and attr.get('web', {}).get('title')
-                        ]
-                    
-                    full_text = text
-                    if sources_list:
-                        # Додаємо розділювач, щоб відокремити джерела від основного тексту
-                        full_text += "\n\n\\*\\*\\*\\n\\*\\*Джерела\\*\\*:\n" + "\n".join(sources_list)
-                        
-                    return full_text
-
-                elif response.status in (429, 500, 503) and attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt) + (random.random() * 0.5)
-                    logger.warning(f"Gemini API: Помилка {response.status}. Спроба {attempt + 1}/{max_retries}. Очікування {delay:.2f}с.")
+            async with session.post(api_url, 
+                                    json=payload, 
+                                    timeout=Config.HTTP_TIMEOUT) as response:
+                
+                if response.status != 200:
+                    logger.warning(f"Gemini API - Спроба {attempt+1}: Отримано статус {response.status}")
                     await asyncio.sleep(delay)
+                    delay *= 2
                     continue
-                else:
-                    logger.error(f"Gemini API повернув статус {response.status}: {await response.text()}")
-                    return None
+                    
+                result = await response.json()
+                
+                # Перевірка структури відповіді
+                candidate = result.get('candidates', [{}])[0]
+                text_part = candidate.get('content', {}).get('parts', [{}])[0].get('text')
+                
+                if not text_part:
+                    logger.warning(f"Gemini API - Спроба {attempt+1}: Порожня відповідь.")
+                    await asyncio.sleep(delay)
+                    delay *= 2
+                    continue
+                
+                # Парсинг JSON
+                try:
+                    # Припускаємо, що модель повернула коректний JSON рядок
+                    parsed_json = json.loads(text_part)
+                    raw_hashtags: List[str] = parsed_json.get('hashtags', [])
+                    
+                    # Фінальне очищення та форматування в Python
+                    final_hashtags = []
+                    for h in raw_hashtags:
+                        # Прибираємо пробіли та інші неалфавітно-цифрові символи, додаємо #
+                        cleaned = re.sub(r'[^а-яА-Яa-zA-Z0-9]', '', h.strip().replace(' ', ''))
+                        if cleaned:
+                            final_hashtags.append(f"#{cleaned}")
+
+                    return final_hashtags[:5] # Обмеження до 5 хештегів
+
+                except json.JSONDecodeError:
+                    logger.error(f"Gemini API - Помилка декодування JSON: {text_part[:100]}...")
+                    return []
+                    
         except asyncio.TimeoutError:
-            logger.error(f"Gemini API: Час очікування вичерпано на спробі {attempt + 1}")
+            logger.warning(f"Gemini API - Спроба {attempt+1}: Таймаут запиту.")
+        except aiohttp.ClientError as e:
+            logger.error(f"Gemini API - Спроба {attempt+1}: Помилка клієнта: {e}")
         except Exception as e:
-            logger.error(f"Непередбачувана помилка під час API-дзвінка: {e}")
-            break
+            logger.error(f"Непередбачувана помилка при запиті до Gemini: {e}")
             
-    logger.error("Не вдалося викликати Gemini API після кількох спроб.")
-    return None
+        await asyncio.sleep(delay)
+        delay *= 2 # Експоненційна затримка
 
-async def generate_expert_news(session: ClientSession, economic_engine: 'EconomicEngine', expert_choice: Optional[str] = None) -> Optional[str]:
-    """Генерує новину-аналітику, використовуючи обраний або випадковий стиль та економічні дані."""
+    logger.error(f"Gemini API - Не вдалося отримати хештеги після {retries} спроб.")
+    return []
+
+async def post_top_unposted_news(bot: Bot, pool: asyncpg.Pool, session: ClientSession) -> int:
+    """
+    Вибирає та публікує до MAX_NEWS_PER_CYCLE (3) найновіших статей з черги,
+    які мають is_posted=FALSE та посилання на фото.
+    """
+    posted_count = 0
     
-    if expert_choice is None or expert_choice == EXPERT_MIXED:
-        expert_choice = random.choice([EXPERT_POLITICAL, EXPERT_ECONOMIC, EXPERT_MIXED])
+    # 1. Вибрати статті з БД
+    async with pool.acquire() as conn:
+        articles = await conn.fetch("""
+            SELECT link, title, summary, image_url, created_at FROM news_articles
+            WHERE is_posted = FALSE AND image_url IS NOT NULL
+            ORDER BY published_time DESC
+            LIMIT $1
+        """, Config.MAX_NEWS_PER_CYCLE)
+
+    if not articles:
+        logger.info("Черга публікації порожня або немає новин з фото.")
+        return 0
+
+    # 2. Отримати список чатів для публікації (УСІ ПІДПИСНИКИ)
+    async with pool.acquire() as conn:
+        subscriber_ids = [r['chat_id'] for r in await conn.fetch("SELECT chat_id FROM subscribers")]
     
-    # Отримуємо звіт з мок-аналітичного двигуна
-    economic_report = await economic_engine.get_report_summary(expert_choice)
+    if not subscriber_ids:
+        logger.warning("Немає активних підписників для публікації новин.")
+        return 0
 
-    if expert_choice == EXPERT_POLITICAL:
-        system_prompt = "Ви — глибокий політичний оглядач, в стилі Віталія Портникова. Створіть стислу, аналітичну новину про актуальні політичні події в Україні чи світі. Тон має бути серйозним, прогнозуючим, з акцентом на історичні паралелі та геополітичні наслідки. Використовуйте **MarkdownV2** для форматування. Не використовуйте заголовки."
-        user_query = f"Напиши одну аналітичну новину, яка включає оцінку політичної ситуації на основі наступних економічних даних:\n{economic_report}"
-        title = "Політична Аналітика"
-    elif expert_choice == EXPERT_ECONOMIC:
-        system_prompt = "Ви — провідний економічний експерт та професор, в стилі Ігоря Лібсіца. Створіть стислу, але ґрунтовну економічну новину-прогноз для України, використовуючи економічні терміни. Тон має бути прагматичним та трохи критичним. Використовуйте **MarkdownV2** для форматування. Не використовуйте заголовки."
-        user_query = f"Напиши один детальний економічний прогноз, аналізуючи наступні дані:\n{economic_report}"
-        title = "Економічний Прогноз"
-    else: 
-        system_prompt = "Ви — аналітик, що поєднує політичну глибину Портникова та економічний прагматизм Лібсіца. Створіть одну, комплексну новину, яка аналізує політичні рішення через призму їхніх економічних наслідків. Використовуйте **MarkdownV2** для форматування. Не використовуйте заголовки."
-        user_query = f"Напиши одну комплексну новину-аналітичну статтю, що поєднує політику та економіку, на основі даних:\n{economic_report}"
-        title = "Комплексний Огляд"
+    # 3. Публікація
+    for article in articles:
+        try:
+            # Використовуємо MarkdownV2 для коректного форматування в Telegram
+            
+            # Очищення заголовка та посилання від символів, які можуть порушити Markdown
+            def escape_markdown_v2(text):
+                # Символи: _, *, [, ], (, ), ~, `, >, #, +, -, =, |, {, }, ., !
+                return re.sub(r'([_*\[\]()~`>#+\-=|{}.!])', r'\\\1', text)
 
-    # Створюємо contents_list для LLM (одноразовий запит)
-    contents_list = [{ "parts": [{ "text": user_query }] }]
-    raw_news_text = await call_gemini_api(session, contents_list, system_prompt)
+            safe_title = escape_markdown_v2(article['title'])
+            
+            # --- НОВА ЛОГІКА: ГЕНЕРАЦІЯ ХЕШТЕГІВ ---
+            # Використовуємо необроблені title/summary для кращого аналізу
+            hashtags = await extract_hashtags_with_gemini(article['title'], article['summary'] or '', session)
+            hashtags_str = " ".join(hashtags)
+            
+            safe_summary = escape_markdown_v2(article['summary'] or '...')
+            
+            # Початковий підпис
+            caption_template = (
+                f"*{safe_title}*\n\n"
+                f"{{summary}}\n\n"
+                f"[Читати повністю]({article['link']})\n\n"
+                f"{hashtags_str}"
+            )
+            
+            # Обмеження на довжину caption: 1024 символи
+            max_caption_len = 1024
+            
+            # Фіксована довжина нижнього колонтитула (без summary)
+            footer_len = len(caption_template.format(summary=''))
+            
+            # Допустима довжина summary
+            max_summary_len = max_caption_len - footer_len - len(safe_title) - 40 
+            
+            if len(safe_summary) > max_summary_len:
+                # Скорочуємо summary
+                shortened_summary = safe_summary[:max_summary_len].strip() + '...'
+                if len(shortened_summary) < 50: # Забезпечуємо мінімальну довжину
+                     shortened_summary = safe_summary[:50].strip() + '...'
+            else:
+                shortened_summary = safe_summary
 
-    if raw_news_text:
-        # Екрануємо заголовок та дату для MarkdownV2
-        escaped_title = re.sub(r'([_*[\]()~`>#+\-=|{}.!])', r'\\\1', title)
-        current_time = datetime.now(KYIV_TZ).strftime("%d\\.%m\\.%Y %H:%M")
-        
-        return (
-            f"📰 \\*\\*{escaped_title} (Станом на {current_time})\\*\\*\n\n"
-            f"{raw_news_text}"
-        )
+            caption = caption_template.format(summary=shortened_summary)
+
+
+            # Публікація в усі чати
+            for chat_id in subscriber_ids:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=article['image_url'],
+                    caption=caption,
+                    parse_mode=ParseMode.MARKDOWN_V2
+                )
+            
+            # Оновлення статусу в БД після успішної публікації
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    UPDATE news_articles SET is_posted = TRUE, posted_at = $1 WHERE link = $2
+                """, datetime.now(KYIV_TZ), article['link'])
+            
+            posted_count += 1
+            await asyncio.sleep(1) # Невеликий таймаут між постами для уникнення FloodWait
+
+        except Exception as e:
+            logger.error(f"Помилка публікації статті {article['link']}: {e}", exc_info=True)
+
+    return posted_count
+
+async def db_cleanup_cycle(pool: asyncpg.Pool):
+    """
+    Фонова задача для очищення старих новин з бази даних.
+    """
+    logger.info("Запуск циклу очищення БД.")
     
-    return None
+    while True:
+        try:
+            # Визначаємо пороговий час (7 днів тому)
+            threshold_time = datetime.now(KYIV_TZ) - timedelta(days=Config.DB_CLEANUP_DAYS)
+            
+            async with pool.acquire() as conn:
+                deleted_count = await conn.execute("""
+                    DELETE FROM news_articles WHERE published_time < $1 AND is_posted = TRUE
+                """, threshold_time)
+                
+            match = re.search(r'DELETE (\d+)', deleted_count)
+            count = int(match.group(1)) if match else 0
+            
+            logger.info(f"Очищення БД завершено. Видалено старих опублікованих статей: {count}")
+
+        except asyncio.CancelledError:
+            logger.info("Цикл очищення БД скасовано.")
+            raise
+        except Exception as e:
+            logger.error(f"Критична помилка в циклі очищення БД: {e}", exc_info=True)
+            
+        # Пауза на 1 годину
+        await asyncio.sleep(Config.CLEANUP_INTERVAL_HOURS * 3600)
 
 
-# --- 7. КОНФІГУРАЦІЯ WEBHOOK I SERVER ---
-
-async def handle_webhook(request: web.Request) -> web.Response:
-    """Обробляє вхідні оновлення від Telegram."""
-    bot: Bot = request.app['bot']
-    dp: Dispatcher = request.app['dp']
+async def scheduled_news_cycle(bot: Bot, pool: asyncpg.Pool, session: ClientSession):
+    """
+    Фонова задача, яка керує пошуком (20 хв) та публікацією (5 хв) новин.
+    """
+    logger.info("Запуск запланованого циклу новин. Початковий інтервал пошуку 20 хв, публікації 5 хв.")
     
+    # Встановлюємо час останнього пошуку на минуле, щоб змусити перший пошук
+    last_fetch_time = datetime.now(KYIV_TZ) - timedelta(minutes=Config.NEWS_FETCH_INTERVAL_MIN + 1)
+    
+    while True:
+        try:
+            current_time = datetime.now(KYIV_TZ)
+            
+            # --- 1. ЛОГІКА ПОШУКУ (КОЖНІ 20 ХВИЛИН) ---
+            if current_time >= last_fetch_time + timedelta(minutes=Config.NEWS_FETCH_INTERVAL_MIN):
+                logger.info(f"Настав час для пошуку нових статей. Інтервал: {Config.NEWS_FETCH_INTERVAL_MIN} хв.")
+                await fetch_and_store_new_articles(pool, session)
+                last_fetch_time = datetime.now(KYIV_TZ)
+                logger.info("Пошук нових статей завершено.")
+                
+            # --- 2. ЛОГІКА ПУБЛІКАЦІЇ (КОЖНІ 5 ХВИЛИН) ---
+            logger.info(f"Настав час для публікації. Інтервал: {Config.NEWS_POST_INTERVAL_MIN} хв.")
+            posted_count = await post_top_unposted_news(bot, pool, session)
+            logger.info(f"Цикл публікації завершено. Опубліковано новин: {posted_count}")
+
+        except asyncio.CancelledError:
+            # Обробка скасування задачі при зупинці сервера
+            logger.info("Запланований цикл новин скасовано.")
+            raise
+        except Exception as e:
+            logger.error(f"Критична помилка в запланованому циклі новин: {e}", exc_info=True)
+            
+        # Пауза на 5 хвилин (інтервал публікації)
+        await asyncio.sleep(Config.NEWS_POST_INTERVAL_MIN * 60)
+
+# --- 5. ХЕНДЛЕРИ ТА ЛОГІКА WEBHOOK ---
+
+async def handle_webhook(request):
+    """Обробка вхідного вебхука від Telegram."""
     try:
-        # Впевнюємося, що ми передаємо об'єкти bot та dp для обробки
-        update = types.Update.model_validate(await request.json(), context={"bot": bot})
-        await dp.feed_update(bot, update)
+        data = await request.json()
+        dp: Dispatcher = request.app["dp"]
+        await dp.feed_raw_update(request.app["bot"], data)
+        return web.Response()
     except Exception as e:
-        logger.error(f"Помилка обробки Webhook: {e}")
-    
-    return web.Response(status=200)
+        logger.error(f"Помилка обробки вебхука: {e}")
+        return web.Response(status=200) # Telegram очікує 200 ОК
+
+
+# --- 6. ХЕНДЛЕРИ КОМАНД (ПРИКЛАД) ---
+
+# Додайте хендлери для команд тут, наприклад /start
+async def command_start_handler(message: types.Message, pool: asyncpg.Pool):
+    """Обробляє команду /start та додає користувача до підписників."""
+    chat_id = message.chat.id
+    try:
+        # Перевіряємо, чи це приватний чат чи канал/група
+        if message.chat.type in ['group', 'supergroup', 'channel']:
+            # Для каналів або груп ми не підписуємо їх, бо бот поститиме туди сам.
+            await message.answer("Ця команда призначена для підписки в приватних чатах. Якщо ви хочете, щоб бот публікував новини в цьому каналі/групі, його потрібно додати як адміністратора.")
+            return
+
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO subscribers (chat_id) VALUES ($1)
+                ON CONFLICT (chat_id) DO NOTHING
+            """, chat_id)
+        await message.answer(
+            "Привіт! 👋 Ви успішно підписалися на розсилку ТОП-новин. "
+            "Я буду надсилати вам до 3 найсвіжіших статей кожні 5 хвилин (за наявності). "
+            "Використовуйте /stop, щоб скасувати підписку."
+        )
+    except Exception as e:
+        logger.error(f"Помилка при обробці /start для {chat_id}: {e}", exc_info=True)
+        await message.answer("Виникла помилка при підписці. Спробуйте пізніше.")
+
+async def command_stop_handler(message: types.Message, pool: asyncpg.Pool):
+    """Обробляє команду /stop та видаляє користувача з підписників."""
+    chat_id = message.chat.id
+    try:
+        async with pool.acquire() as conn:
+            result = await conn.execute("""
+                DELETE FROM subscribers WHERE chat_id = $1
+            """, chat_id)
+        
+        if result == 'DELETE 1':
+            await message.answer("Ви успішно відписалися від розсилки новин. Дякуємо!")
+        else:
+             await message.answer("Ви вже не були підписані на розсилку.")
+             
+    except Exception as e:
+        logger.error(f"Помилка при обробці /stop для {chat_id}: {e}", exc_info=True)
+        await message.answer("Виникла помилка при відписці. Спробуйте пізніше.")
+
+
+# --- 7. ФУНКЦІЇ ЗАПУСКУ ТА ВИМКНЕННЯ ---
 
 async def on_startup(app: web.Application):
-    """Дії, що виконуються при запуску додатка."""
-    pool: asyncpg.Pool = app['pool']
-    bot: Bot = app['bot']
-    dp: Dispatcher = app['dp']
-    
+    """Виконується при запуску Webhook сервера."""
     logger.info("Запуск on_startup...")
-    
-    # 1. Створення/перевірка таблиць в DB
-    await create_db_tables(pool)
-    # ЛОГ: оновлено для консистентності
-    logger.info("Таблиця 'subscribers' перевірена/створена.")
+    bot: Bot = app["bot"]
+    pool: asyncpg.Pool = app["pool"]
+    session: ClientSession = app["session"]
 
-    # 2. Встановлення Webhook
+    # 1. Створення/перевірка схеми БД
+    await setup_db_schema(pool)
     
-    # КРИТИЧНА ПЕРЕВІРКА: WEBHOOK_HOST має бути публічним HTTPS-доменом
-    if not WEBHOOK_HOST or "placeholder-host" in WEBHOOK_HOST or not WEBHOOK_HOST.startswith("https://"):
-        logger.critical(
-            "WEBHOOK_HOST environment variable is NOT set correctly. "
-            "Він має бути публічною HTTPS-адресою (домен або IP), а не внутрішньою (як 0.0.34.96)."
-        )
-        # Продовжуємо, але Telegram поверне помилку, якщо WEBHOOK_HOST недійсний
-    
+    # 2. Встановлення вебхука
     try:
-        webhook_info: WebhookInfo = await bot.get_webhook_info()
-        
-        if webhook_info.url != WEBHOOK_URL:
-            success = await bot.set_webhook(
-                url=WEBHOOK_URL,
-                allowed_updates=dp.resolve_used_update_types(),
-                drop_pending_updates=True
-            )
-            if success:
-                 logger.info(f"Встановлення Webhook на URL: {WEBHOOK_URL} - Успішно.")
-            else:
-                logger.critical(f"Помилка встановлення Webhook: Telegram server returned False.")
-        else:
-            logger.info(f"Webhook вже встановлено на URL: {WEBHOOK_URL}")
-
+        await bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
+        logger.info(f"Встановлення Webhook на URL: {WEBHOOK_URL} - Успішно.")
     except Exception as e:
-        logger.critical(f"Критична помилка встановлення Webhook: Telegram server says - {e}")
-
-    # Фонове завдання щогодинної розсилки було видалено на запит користувача.
-
+        logger.error(f"Помилка встановлення вебхука: {e}")
+        
+    # 3. Запуск запланованих циклів (ВАЖЛИВО!)
+    # Фонова задача публікації/пошуку новин
+    app["news_task"] = asyncio.create_task(scheduled_news_cycle(bot, pool, session))
+    # Фонова задача очищення БД
+    app["cleanup_task"] = asyncio.create_task(db_cleanup_cycle(pool))
     
+    logger.info("Запуск on_startup... Успішно. Запущено 2 фонові задачі.")
+
+
 async def on_shutdown(app: web.Application):
-    """Дії, що виконуються при зупинці додатка."""
-    bot: Bot = app['bot']
-    session: ClientSession = app['session']
-    pool: asyncpg.Pool = app['pool']
-    
+    """Виконується при зупинці Webhook сервера."""
     logger.info("Запуск on_shutdown...")
-    
-    # Фонове завдання щогодинної розсилки було видалено на запит користувача.
-    
-    # 1. Видалення Webhook
-    try:
-        await bot.delete_webhook()
-        logger.info("Webhook успішно видалено.")
-    except Exception as e:
-        logger.warning(f"Помилка видалення Webhook: {e}")
+    bot: Bot = app["bot"]
+    pool: asyncpg.Pool = app["pool"]
+    session: ClientSession = app["session"]
+
+    # 1. Відміна фонових задач (ВАЖЛИВО!)
+    if "news_task" in app:
+        app["news_task"].cancel()
+    if "cleanup_task" in app:
+        app["cleanup_task"].cancel()
         
-    # 2. Закриття HTTP сесії та пулу DB
-    await session.close()
+    # Чекаємо завершення скасованих задач
+    tasks_to_wait = []
+    if "news_task" in app: tasks_to_wait.append(app["news_task"])
+    if "cleanup_task" in app: tasks_to_wait.append(app["cleanup_task"])
+    
+    if tasks_to_wait:
+        await asyncio.gather(*tasks_to_wait, return_exceptions=True)
+        logger.info("Всі фонові задачі скасовано.")
+        
+    # 2. Видалення вебхука
+    await bot.delete_webhook()
+    logger.info("Webhook видалено.")
+
+    # 3. Закриття пулу з'єднань з БД
     await pool.close()
-    logger.info("HTTP сесія та пул DB закриті.")
+    logger.info("Пул з'єднань з БД закрито.")
+    
+    # 4. Закриття HTTP сесії
+    await session.close()
+    logger.info("HTTP сесію закрито.")
+    
+    logger.info("Запуск on_shutdown... Успішно.")
 
-
-# --- 8. ОСНОВНА ФУНКЦІЯ ЗАПУСКУ ---
 
 async def main():
-    """Налаштування пулу DB, бота, диспетчера, EconomicEngine та aiohttp сервера."""
-    if not BOT_TOKEN or not DATABASE_URL:
-        logger.critical("Не встановлено BOT_TOKEN або DATABASE_URL.")
+    """Основна точка входу для застосунку Webhook."""
+    if not BOT_TOKEN or not DATABASE_URL or not WEBHOOK_HOST:
+        logger.error("Необхідні змінні оточення (BOT_TOKEN, DATABASE_URL, WEBHOOK_HOST) не встановлені.")
         sys.exit(1)
 
-    # 1. Ініціалізація компонентів
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2))
+    # Ініціалізація компонентів
+    bot = Bot(
+        token=BOT_TOKEN,
+        # Встановлюємо ParseMode.MARKDOWN_V2 для кращого контролю форматування
+        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN_V2) 
+    )
     dp = Dispatcher()
     
-    try:
-        pool = await asyncpg.create_pool(DATABASE_URL)
-    except Exception as e:
-        logger.critical(f"Помилка підключення до бази даних: {e}")
-        sys.exit(1)
-        
-    session = ClientSession()
-    
-    # НОВИЙ КОМПОНЕНТ: Ініціалізація аналітичного двигуна
-    economic_engine = EconomicEngine(pool)
-    
-    # Реєстрація головного роутера з хендлерами
-    dp.include_router(router) 
+    # Реєстрація хендлерів
+    dp.message.register(command_start_handler, Command("start"))
+    dp.message.register(command_stop_handler, Command("stop")) # Додано /stop
 
+    # Створення пулу з'єднань з БД
+    pool = await asyncpg.create_pool(DATABASE_URL)
+    
+    # Створення HTTP сесії
+    # trust_env=True дозволяє використовувати налаштування проксі з середовища (важливо для деяких хостингів)
+    session = aiohttp.ClientSession(headers=Config.DEFAULT_HEADERS, trust_env=True)
+    
     # 2. Налаштування aiohttp Web
     app = web.Application()
     
-    # 3. Зберігання ресурсів у додатку для Dependency Injection
+    # 3. Зберігання ресурсів у додатку
     app["bot"] = bot
     app["dp"] = dp
     app["pool"] = pool
     app["session"] = session
-    app["economic_engine"] = economic_engine # Передаємо EconomicEngine
-
-    # 4. Реєстрація залежностей через outer_middleware
-    dp.message.outer_middleware.register(lambda handler, event, data: {**data, 'session': session, 'pool': pool, 'bot': bot, 'economic_engine': economic_engine})
-    dp.callback_query.outer_middleware.register(lambda handler, event, data: {**data, 'session': session, 'pool': pool, 'bot': bot, 'economic_engine': economic_engine})
+    
+    # 4. Реєстрація залежностей для хендлерів DP
+    # Впровадження залежностей (pool та session) у хендлери
+    # Додаємо session, pool, bot в контекст
+    dp.message.outer_middleware.register(lambda handler, event, data: {**data, 'session': session, 'pool': pool})
+    dp.callback_query.outer_middleware.register(lambda handler, event, data: {**data, 'session': session, 'pool': pool})
     
     # 5. Реєстрація маршруту для вебхука
     app.router.add_post(WEBHOOK_PATH, handle_webhook, name="webhook_handler")
@@ -660,16 +773,17 @@ async def main():
     await runner.setup()
     site = web.TCPSite(runner, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
     
+    # Запуск сервера
     await site.start()
     
-    # Нескінченний цикл для підтримки роботи сервера
-    while True:
-        await asyncio.sleep(3600) 
+    # Тримаємо основний потік відкритим, поки не буде сигналу зупинки
+    await asyncio.Event().wait()
 
-if __name__ == "__main__":
+
+if __name__ == '__main__':
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Бот зупинено вручну.")
     except Exception as e:
-        logger.critical(f"Глобальна помилка виконання: {e}")
+        logger.error(f"Головна помилка: {e}", exc_info=True)
