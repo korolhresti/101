@@ -663,19 +663,28 @@ async def fetch_all_sources():
 # --- 5. ФОРМАТУВАННЯ ТА ПОСТИНГ ---
 
 def format_news_post(news_item: dict) -> str:
-    """Форматує новину для публікації у Telegram (HTML) з часом, CTA та хештегами."""
+    """
+    Форматує новину для публікації у Telegram (HTML).
+    
+    ВИПРАВЛЕНО: Прибрано час перед посиланням.
+    ВИПРАВЛЕНО: Додано гіперпосилання https://t.me/newsone234 до CTA.
+    """
     source_display = news_item['source'].replace('https://', '').replace('http://', '')
-    published_time_str = news_item['published_at'].strftime(TIME_FORMAT)
     
     hashtags = generate_hashtags(news_item['title'], news_item['summary'])
     emoji = get_post_emoji(hashtags)
     
+    # Використовуємо явне посилання на канал, як ви просили
+    channel_link = "https://t.me/newsone234"
+    
     message = (
         f"{emoji} <b>{news_item['title']}</b>\n\n"
         f"{news_item['summary']}\n\n"
-        f"🕰️ {published_time_str} | <a href='{news_item['url']}'>Подробиці на {source_display}</a>\n"
+        # Час прибрано
+        f"<a href='{news_item['url']}'>Подробиці на {source_display}</a>\n" 
         f"{hashtags}\n\n"
-        f"<i>{bot_state.cta_text}</i>"
+        # CTA з гіперпосиланням
+        f"<a href='{channel_link}'><i>{bot_state.cta_text}</i></a>"
     )
     return message
 
@@ -813,6 +822,7 @@ async def send_admin_notification(message: str, is_error: bool = False):
     try:
         await bot.send_message(ADMIN_ID, full_message, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
+        # Ваш лог містить: Bad Request: chat not found. Перевірте, чи ADMIN_ID вірний (це має бути ваш ID користувача, не канал)
         logger.error(f"Не вдалося надіслати сповіщення адміну: {e}")
 
 # --- 6. ОСНОВНИЙ ЦИКЛ АВТОПОСТИНГУ ---
@@ -881,7 +891,7 @@ async def cmd_status(message: types.Message):
         f"  📝 Макс. постів за цикл: <b>{Config.MAX_NEWS_PER_CYCLE}</b>\n"
         f"  🏆 Дайджест: {Config.DAILY_DIGEST_HOUR}:00 ({Config.DAILY_DIGEST_LIMIT} новин)\n"
         f"  🖼️ Watermark: {'✅ УВІМКНЕНО' if bot_state.watermark_enabled else '❌ ВИМКНЕНО'} (Текст: <code>{bot_state.watermark_text}</code>)\n"
-        f"  ✍️ CTA: <code>{bot_state.cta_text}</code>\n"
+        f"  ✍️ CTA: <code>{bot_state.cta_text}</code> (Посилання: https://t.me/newsone234)\n"
         f"  🚫 Вимкнені джерела:\n{disabled_sources_list}\n\n"
         "<b>📊 Статистика Бази Даних:</b>\n"
         f"{stats_text}"
