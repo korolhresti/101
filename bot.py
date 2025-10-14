@@ -3,6 +3,7 @@ import asyncio
 import logging
 import re
 import random
+import json
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urljoin
 
@@ -11,8 +12,8 @@ import asyncpg
 import aiohttp
 import feedparser
 from bs4 import BeautifulSoup
-from PIL import Image, ImageDraw, ImageFont # 🎨 НОВА БІБЛІОТЕКА ДЛЯ WATERMARK
-from io import BytesIO # Для роботи з зображеннями в пам'яті
+from PIL import Image, ImageDraw, ImageFont 
+from io import BytesIO 
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
@@ -24,37 +25,42 @@ from aiogram.exceptions import TelegramAPIError
 
 # Використовуйте Kyiv time zone (UTC+3)
 KYIV_TZ = timezone(timedelta(hours=3), 'Europe/Kyiv')
-# Формат часу для відображення
 TIME_FORMAT = "%H:%M" 
-# Шлях до шрифту для Watermark (ВИ ПОВИННІ ЙОГО ДОДАТИ! Наприклад, Arial.ttf)
+# Шлях до шрифту для Watermark (ПЕРЕВІРТЕ НА СВОЄМУ СЕРВЕРІ)
 # Якщо не буде знайдено, буде використовуватись дефолтний PIL-шрифт.
 FONT_PATH = "arial.ttf" 
 
+# Максимально допустимий розмір зображення для обробки та Telegram (20MB)
+MAX_IMAGE_SIZE_BYTES = 20 * 1024 * 1024 
+
 class Config:
-    """Конфігурація платформи, зібрана в одному місці."""
+    """
+    Професійна Конфігурація платформи. 
+    Усі статичні налаштування зібрані в одному місці.
+    """
     
-    # ⚙️ ОСНОВНІ ПАРАМЕТРИ ЦИКЛУ (Рекомендовані для стабільної роботи)
-    POSTING_INTERVAL_MIN = 5  # Кожні 5 хвилин
-    FETCH_INTERVAL_MIN = 5    # Кожні 5 хвилин (винесено окремо для динаміки)
-    MAX_NEWS_PER_CYCLE = 3   # СТРОГИЙ ЛІМІТ: До 3 новин за цикл (ТОП-3)
-    MAX_AGE_MIN = 45          # Не публікувати новини старше 45 хвилин (Збільшено для більшої вибірки)
-    DAILY_DIGEST_HOUR = 21    # Година публікації Дайджесту (21:00)
-    DAILY_DIGEST_LIMIT = 5    # Кількість новин у Дайджесті
+    # ⚙️ ОСНОВНІ ПАРАМЕТРИ ЦИКЛУ
+    POSTING_INTERVAL_MIN = 5  # Динамічно змінюється через /set_interval, але це значення за замовчуванням
+    FETCH_INTERVAL_MIN = 5    # Інтервал парсингу (визначено тут)
+    MAX_NEWS_PER_CYCLE = 3   
+    MAX_AGE_MIN = 45          
+    DAILY_DIGEST_HOUR = 21    
+    DAILY_DIGEST_LIMIT = 5    
 
     # 🛡️ ПАРАМЕТРИ НАДІЙНОСТІ ТА ПРОДУКТИВНОСТІ
-    FETCH_LIMIT = 50          # Макс. кількість записів для аналізу в кожному RSS-фіді (Збільшено)
-    NUM_SOURCES_TO_FETCH = 25 # Кількість випадкових джерел, які будуть перевірені за цикл (Збільшено)
-    HTTP_TIMEOUT = 15         # Таймаут HTTP-запиту в секундах
-    MAX_CONCURRENCY = 20      # Макс. кількість одночасних HTTP-з'єднань (Збільшено для швидкості)
-    TELEGRAM_POST_DELAY = 2   # Затримка між постами в Telegram (сек)
+    FETCH_LIMIT = 50          
+    NUM_SOURCES_TO_FETCH = 25 
+    HTTP_TIMEOUT = 15         
+    MAX_CONCURRENCY = 20      
+    TELEGRAM_POST_DELAY = 2   
 
     # 💾 ПАРАМЕТРИ ОБСЛУГОВУВАННЯ БАЗИ ДАНИХ
-    DB_CLEANUP_DAYS = 14      # Видаляти новини, старші за 14 днів (Збільшено для статистики дайджесту)
-    CLEANUP_INTERVAL_HOURS = 2 # Інтервал очищення (кожні 2 години)
+    DB_CLEANUP_DAYS = 14      
+    CLEANUP_INTERVAL_HOURS = 2 
     
     # 🖼️ ПАРАМЕТРИ WATERMARK
-    DEFAULT_WATERMARK = "@YourChannelName" # СТАНДАРТНИЙ ТЕКСТ
-    DEFAULT_CTA = "👉 Підписатись на @YourChannelName" # СТАНДАРТНИЙ ЗАКЛИК ДО ДІЇ
+    DEFAULT_WATERMARK = "@YourChannelName" 
+    DEFAULT_CTA = "👉 Підписатись на @YourChannelName" 
     
     DEFAULT_HEADERS = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Bot/1.0', 
@@ -62,7 +68,7 @@ class Config:
         'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
     }
 
-    # 1. 📰 Джерела новин (Розширено)
+    # 1. 📰 Джерела новин (Розширений список)
     SOURCES = [
         "https://tsn.ua/rss/all.xml", "https://www.pravda.com.ua/rss/news/", 
         "https://censor.net/rss/all_news", "https://www.rbc.ua/static/rss/all.xml",
@@ -75,11 +81,14 @@ class Config:
         "https://news.finance.ua/ua/rss", "https://www.unian.ua/rss/news.rss", 
         "https://ua.interfax.com.ua/news/ukraine.rss", "https://zaxid.net/rss",
         "https://hromadske.ua/feed/news", "https://biz.censor.net/rss",
-        "https://apostrophe.ua/rss/all", "https://espreso.tv/rss.xml" # Додано нові джерела
+        "https://apostrophe.ua/rss/all", "https://espreso.tv/rss.xml" 
     ]
 
 class BotState:
-    """Динамічні налаштування та стан бота."""
+    """
+    Клас для зберігання Динамічних налаштувань. 
+    Підтримує серіалізацію/десеріалізацію для персистенції стану в БД.
+    """
     def __init__(self):
         self.watermark_text = Config.DEFAULT_WATERMARK
         self.cta_text = Config.DEFAULT_CTA
@@ -87,7 +96,39 @@ class BotState:
         self.posting_interval_min = Config.POSTING_INTERVAL_MIN
         self.fetch_interval_min = Config.FETCH_INTERVAL_MIN
         self.disabled_sources = set()
-        self.last_digest_date = datetime.now(KYIV_TZ).date() - timedelta(days=1) # Щоб запустився при першому старті
+        self.last_digest_date = datetime.now(KYIV_TZ).date() - timedelta(days=1) 
+        
+    def to_dict(self):
+        """Серіалізація стану для збереження в JSON."""
+        return {
+            'watermark_text': self.watermark_text,
+            'cta_text': self.cta_text,
+            'watermark_enabled': self.watermark_enabled,
+            'posting_interval_min': self.posting_interval_min,
+            'fetch_interval_min': self.fetch_interval_min,
+            'disabled_sources': list(self.disabled_sources), # Set -> List для JSON
+            'last_digest_date': self.last_digest_date.isoformat(),
+        }
+
+    def from_dict(self, data: dict):
+        """Десеріалізація стану з JSON."""
+        if not data:
+            return
+            
+        self.watermark_text = data.get('watermark_text', Config.DEFAULT_WATERMARK)
+        self.cta_text = data.get('cta_text', Config.DEFAULT_CTA)
+        self.watermark_enabled = data.get('watermark_enabled', True)
+        self.posting_interval_min = data.get('posting_interval_min', Config.POSTING_INTERVAL_MIN)
+        self.fetch_interval_min = data.get('fetch_interval_min', Config.FETCH_INTERVAL_MIN)
+        self.disabled_sources = set(data.get('disabled_sources', []))
+        
+        digest_date_str = data.get('last_digest_date')
+        if digest_date_str:
+            try:
+                self.last_digest_date = datetime.fromisoformat(digest_date_str).date()
+            except ValueError:
+                self.last_digest_date = datetime.now(KYIV_TZ).date() - timedelta(days=1)
+
 
 # Ініціалізація глобального стану
 bot_state = BotState()
@@ -97,7 +138,7 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# Змінні середовища
+# Змінні середовища (Беруться з оточення)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
@@ -112,8 +153,6 @@ dp: Dispatcher = None
 bot: Bot = None
 
 # --- 2. БАЗА ДАНИХ (POSTGRESQL/NEON) ---
-# ... (connect_db, init_db, save_news_to_db, mark_news_as_posted, cleanup_db, get_db_stats залишено без змін,
-# крім додавання is_digested до init_db та оновлення get_unique_news_from_db для дайджесту)
 
 async def connect_db():
     """Створює пул з'єднань до бази даних Neon (PostgreSQL)."""
@@ -128,15 +167,17 @@ async def connect_db():
         logger.info("✅ Успішно підключено до Neon PostgreSQL.")
     except Exception as e:
         logger.error(f"❌ Критична помилка підключення до DB: {e}")
+        # Зупинка, якщо немає підключення до БД (критично)
         await asyncio.sleep(60)
         exit(1)
 
 async def init_db():
-    """Створює таблицю 'news', якщо вона не існує, та додає необхідні стовпці."""
+    """Створює таблиці 'news' та 'bot_settings', якщо вони не існують."""
     if not db_pool:
         return
 
     async with db_pool.acquire() as conn:
+        # Таблиця news
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS news (
                 id SERIAL PRIMARY KEY,
@@ -150,22 +191,69 @@ async def init_db():
             );
         """)
         
-        try:
-            await conn.execute("ALTER TABLE news ADD COLUMN is_posted BOOLEAN DEFAULT FALSE;")
-        except asyncpg.exceptions.DuplicateColumnError:
-            pass 
-        
-        try:
-            await conn.execute("ALTER TABLE news ADD COLUMN is_digested BOOLEAN DEFAULT FALSE;") # НОВЕ: для дайджесту
-        except asyncpg.exceptions.DuplicateColumnError:
-            pass 
+        # Перевірка та додавання стовпців
+        for column in [("is_posted", "BOOLEAN DEFAULT FALSE"), ("is_digested", "BOOLEAN DEFAULT FALSE")]:
+            try:
+                await conn.execute(f"ALTER TABLE news ADD COLUMN {column[0]} {column[1]};")
+            except asyncpg.exceptions.DuplicateColumnError:
+                pass 
         
         try:
             await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS news_url_idx ON news (url);")
         except Exception as e:
             logger.error(f"Помилка при створенні індексу: {e}")
 
-    logger.info("Таблиця 'news' перевірена/оновлена.")
+        # Таблиця bot_settings (для персистенції стану)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key VARCHAR(50) PRIMARY KEY,
+                value JSONB NOT NULL
+            );
+        """)
+
+    logger.info("Таблиці DB перевірені/оновлені.")
+
+
+async def load_bot_state_from_db():
+    """Завантажує динамічний стан бота з БД при старті."""
+    if not db_pool:
+        return
+
+    try:
+        async with db_pool.acquire() as conn:
+            record = await conn.fetchrow("SELECT value FROM bot_settings WHERE key = 'current_state'")
+            
+            if record and record['value']:
+                bot_state.from_dict(record['value'])
+                logger.info("✅ Динамічний стан бота успішно завантажено з БД.")
+                return
+
+    except asyncpg.exceptions.PostgresError as e:
+        logger.error(f"❌ Помилка завантаження стану з БД: {e}")
+        
+    logger.info("ℹ️ Стан БД не знайдено. Використовуються конфігураційні значення за замовчуванням.")
+
+async def save_bot_state_to_db():
+    """Зберігає динамічний стан бота в БД після кожної зміни."""
+    if not db_pool:
+        return
+
+    state_dict = bot_state.to_dict()
+    state_json = json.dumps(state_dict) 
+
+    sql = """
+        INSERT INTO bot_settings (key, value)
+        VALUES ('current_state', $1::jsonb)
+        ON CONFLICT (key) DO UPDATE
+        SET value = $1::jsonb;
+    """
+    
+    try:
+        async with db_pool.acquire() as conn:
+            await conn.execute(sql, state_json)
+        logger.info("💾 Динамічний стан бота успішно збережено в БД.")
+    except asyncpg.exceptions.PostgresError as e:
+        logger.error(f"❌ Помилка збереження стану в БД: {e}")
 
 
 async def save_news_to_db(news_items: list):
@@ -173,7 +261,6 @@ async def save_news_to_db(news_items: list):
     if not news_items or not db_pool:
         return 0
     
-    # Додано стовпець is_digested зі значенням FALSE
     sql = """
         INSERT INTO news (source, url, title, summary, image_url, published_at, is_digested)
         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::boolean[])
@@ -187,7 +274,7 @@ async def save_news_to_db(news_items: list):
     summaries = [item['summary'] for item in news_items]
     image_urls = [item['image_url'] for item in news_items]
     published_at_list = [item['published_at'] for item in news_items]
-    is_digested_list = [False] * len(news_items) # Початкове значення
+    is_digested_list = [False] * len(news_items) 
     
     try:
         async with db_pool.acquire() as conn:
@@ -224,7 +311,6 @@ async def get_daily_digest_news(limit: int) -> list:
     if not db_pool:
         return []
 
-    # Вибираємо найновіші, ще не опубліковані у дайджесті, за останню добу
     start_time = datetime.now(KYIV_TZ) - timedelta(hours=24)
     
     sql = """
@@ -233,7 +319,7 @@ async def get_daily_digest_news(limit: int) -> list:
         WHERE published_at >= $1
           AND is_digested = FALSE
         ORDER BY 
-            published_at DESC -- Можна змінити на ORDER BY RANDOM() або складніший рейтинг
+            published_at DESC 
         LIMIT $2;
     """
     try:
@@ -262,7 +348,7 @@ async def mark_news_as_posted(urls: list, is_digested=False):
         logger.error(f"❌ Помилка оновлення {field_to_update} в БД: {e}")
 
 async def cleanup_db():
-    # ... (Cleanup без змін)
+    """Видаляє старі новини з БД для підтримки продуктивності."""
     if not db_pool:
         return
         
@@ -284,7 +370,7 @@ async def cleanup_db():
         return 0
 
 async def get_db_stats():
-    # ... (Статистика оновлена)
+    """Отримує статистику по базі даних."""
     if not db_pool:
         return None
         
@@ -304,11 +390,10 @@ async def get_db_stats():
         logger.error(f"❌ Помилка отримання статистики з БД: {e}")
         return None
 
-# --- 3. ХЕЛПЕРИ ПАРСИНГУ ---
+# --- 3. ХЕЛПЕРИ ПАРСИНГУ ТА ОБРОБКИ ---
 
-# Розширений список стоп-слів
 def is_news_relevant(title: str, summary: str) -> bool:
-    """Перевіряє, чи не стосується новина заблокованих тем (зірки, футбол, гороскопи, тощо)."""
+    """Перевіряє, чи не стосується новина заблокованих тем."""
     if not title and not summary:
         return False
         
@@ -318,16 +403,13 @@ def is_news_relevant(title: str, summary: str) -> bool:
         "зірок", "зірка", "шоу-бізнес", "світське життя", "особисте життя", 
         "вагітність", "розлучення", "скандал", "тсн.особливе", "телебачення", 
         "кіно", "мода", "гламур", "голлівуд", "селебриті", # Зірки
-        "футбол", "матч", "ліга чемпіонів", "ліга європи", "прем'єр-ліга",
-        "динамо", "шахтар", "фк ", "борусія", "реал", "барселона", # Спорт
+        "футбол", "матч", "ліга чемпіонів", "прем'єр-ліга", "динамо", "шахтар", "фк ", # Спорт
         "гороскоп", "прогноз погоди", "рецепт", "порада", "кулінарія", "догляд", # Сміття
-        "прикмета", "сонник" # Містика
+        "прикмета", "сонник"
     ]
     
     for keyword in irrelevant_keywords:
-        # Перевірка на ціле слово для уникнення хибних спрацювань усередині слів
         if re.search(r'\b' + re.escape(keyword) + r'\b', text):
-            logger.debug(f"Пропущено новину (НЕРЕЛЕВАНТ): {title[:50]}... ({keyword})")
             return False
             
     return True
@@ -339,20 +421,175 @@ def normalize_summary(text: str) -> str:
     soup = BeautifulSoup(text, 'html.parser')
     clean_text = soup.get_text()
     clean_text = ' '.join(clean_text.split())
-    return clean_text[:600].strip() # Збільшено до 600 символів
+    return clean_text[:600].strip()
 
-# extract_image_url та parse_published_time залишено без змін
+def extract_image_url(entry):
+    """Видобуває URL зображення з різних полів RSS/Atom запису."""
+    # ... (логіка видобування зображення)
+    if hasattr(entry, 'media_content') and entry.media_content:
+        for media in entry.media_content:
+            if media.get('url') and 'image' in media.get('type', ''):
+                return media['url']
+    if hasattr(entry, 'media_thumbnail') and entry.media_thumbnail:
+        for thumb in entry.media_thumbnail:
+            if thumb.get('url'):
+                return thumb['url']
+    if hasattr(entry, 'enclosures') and entry.enclosures:
+        for enclosure in entry.enclosures:
+            if enclosure.get('url') and 'image' in enclosure.get('type', ''):
+                return enclosure['url']
+    if hasattr(entry, 'image') and entry.image and entry.image.get('href'):
+        return entry.image.get('href')
+    
+    # Парсинг summary/content
+    if hasattr(entry, 'summary') and entry.summary:
+        soup = BeautifulSoup(entry.summary, 'html.parser')
+        img = soup.find('img')
+        if img and img.get('src'):
+            return img.get('src')
+    
+    if hasattr(entry, 'content') and entry.content:
+        for content in entry.content:
+            soup = BeautifulSoup(content.value, 'html.parser')
+            img = soup.find('img')
+            if img and img.get('src'):
+                return img.get('src')
+                
+    return None
+
+def parse_published_time(entry, rss_url: str):
+    """Парсить час публікації, повертаючи datetime в часовій зоні Києва."""
+    published_time = None
+    if hasattr(entry, 'published_parsed'):
+        try:
+            published_time = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).astimezone(KYIV_TZ)
+        except Exception:
+            pass # Пропускаємо, якщо час не валідний
+            
+    if not published_time and hasattr(entry, 'updated_parsed'):
+        try:
+            published_time = datetime(*entry.updated_parsed[:6], tzinfo=timezone.utc).astimezone(KYIV_TZ)
+        except Exception:
+            pass
+            
+    if not published_time:
+        # Встановлюємо час вставки як час публікації, якщо не вдалося спарсити
+        published_time = datetime.now(KYIV_TZ)
+        logger.warning(f"Не вдалося спарсити час для {rss_url}. Використано поточний час.")
+        
+    return published_time
+
+def generate_hashtags(title: str, summary: str) -> str:
+    """Генерує до 3-х релевантних хештегів на основі ключових слів."""
+    text = (title + " " + summary).lower()
+    
+    keyword_map = {
+        'війна': '#Війна', 'рф': '#Війна', 'росія': '#Війна', 'обстріл': '#Війна', 'фронт': '#Фронт',
+        'зеленський': '#Зеленський', 'президент': '#Політика', 'парламент': '#Політика', 'рада': '#Політика',
+        'долар': '#Фінанси', 'гривня': '#Фінанси', 'банк': '#Фінанси', 'економіка': '#Економіка', 'ціни': '#Економіка',
+        'єс': '#Європа', 'сша': '#США', 'україна': '#Україна', 'київ': '#Київ',
+        'суд': '#Право', 'кримінал': '#Право', 'поліція': '#Право', 'закон': '#Право',
+        'технології': '#Техно', 'наука': '#Наука', 'медицина': '#Медицина'
+    }
+    
+    found_hashtags = set()
+    
+    for keyword, hashtag in keyword_map.items():
+        # Регулярний вираз для пошуку слова, що закінчується на ключове слово (у різних відмінках)
+        if re.search(r'\b' + re.escape(keyword) + r'\w*\b', text): 
+            found_hashtags.add(hashtag)
+        
+        if len(found_hashtags) >= 3:
+            break
+            
+    return " ".join(list(found_hashtags))
+
+def get_post_emoji(hashtags: str) -> str:
+    """Вибирає тематичний емодзі для початку посту."""
+    if '#Війна' in hashtags: return '🛡️'
+    if '#Фінанси' in hashtags or '#Економіка' in hashtags: return '💰'
+    if '#Політика' in hashtags: return '🏛️'
+    if '#Європа' in hashtags or '#США' in hashtags: return '🌍'
+    return '📰'
+
+async def apply_watermark(image_url: str, text: str) -> BytesIO | None:
+    """Завантажує зображення, додає водяний знак і повертає його у форматі BytesIO."""
+    if not bot_state.watermark_enabled:
+        return None
+        
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(image_url, headers=Config.DEFAULT_HEADERS, timeout=Config.HTTP_TIMEOUT) as response:
+                response.raise_for_status()
+                
+                # 🛡️ ПЕРЕВІРКА НАДІЙНОСТІ: Розмір файлу
+                content_length = response.content_length
+                if content_length and content_length > MAX_IMAGE_SIZE_BYTES:
+                    logger.warning(f"❌ Зображення занадто велике ({content_length} байт). Пропущено Watermark.")
+                    return None
+                
+                # 🛡️ ПЕРЕВІРКА НАДІЙНОСТІ: Тип контенту
+                content_type = response.headers.get('Content-Type', '').lower()
+                if not content_type.startswith('image/'):
+                    logger.warning(f"❌ Очікувався image/*, отримано {content_type}. Пропущено Watermark.")
+                    return None
+
+                image_bytes = await response.read()
+
+        img = Image.open(BytesIO(image_bytes)).convert("RGBA")
+        width, height = img.size
+
+        # Динамічний розмір шрифту
+        font_size = max(18, height // 20)
+        
+        try:
+            font = ImageFont.truetype(FONT_PATH, font_size)
+        except IOError:
+            font = ImageFont.load_default()
+        
+        watermark_layer = Image.new('RGBA', (width, height), (255, 255, 255, 0))
+        draw = ImageDraw.Draw(watermark_layer)
+
+        # Визначення позиції (правий нижній кут)
+        text_bbox = draw.textbbox((0, 0), text, font=font)
+        text_width = text_bbox[2] - text_bbox[0]
+        text_height = text_bbox[3] - text_bbox[1]
+        
+        margin = 10
+        position = (width - text_width - margin, height - text_height - margin)
+
+        # Малюємо контур (тінь) для кращої читабельності
+        shadow_color = (0, 0, 0, 150)
+        main_color = (255, 255, 255, 255)
+        
+        # Додавання тіні
+        for offset in [(1, 1), (-1, 1), (1, -1), (-1, -1)]:
+            draw.text((position[0] + offset[0], position[1] + offset[1]), text, font=font, fill=shadow_color)
+            
+        # Додавання основного тексту
+        draw.text(position, text, font=font, fill=main_color)
+
+        watermarked_img = Image.alpha_composite(img.convert('RGBA'), watermark_layer)
+        watermarked_img = watermarked_img.convert("RGB") 
+
+        # Збереження у BytesIO
+        output = BytesIO()
+        watermarked_img.save(output, format="JPEG", quality=90)
+        output.seek(0)
+        return output
+
+    except Exception as e:
+        logger.error(f"❌ Критична помилка обробки Watermark для {image_url}: {type(e).__name__}: {e}")
+        return None
 
 # --- 4. ОСНОВНИЙ ПАРСИНГ ---
 
-# Оновлення логіки для відстеження недоступності стрічок
 async def fetch_and_parse_source(session, rss_url: str):
-    """Парсить одне джерело."""
+    """Парсить одне джерело з перевіркою статусу та відправкою сповіщень адміну."""
     news_items = []
     source_domain = urlparse(rss_url).netloc.replace('www.', '')
     
     if source_domain in bot_state.disabled_sources:
-        logger.debug(f"⚠️ Пропущено вимкнене джерело: {source_domain}")
         return []
 
     try:
@@ -375,7 +612,6 @@ async def fetch_and_parse_source(session, rss_url: str):
     max_age_dt = timedelta(minutes=Config.MAX_AGE_MIN) 
 
     for entry in feed.entries[:Config.FETCH_LIMIT]:
-        # ... (логіка парсингу запису залишена без змін)
         try:
             url = entry.link
             title = entry.title
@@ -405,7 +641,6 @@ async def fetch_all_sources():
     all_news = []
     start_time = datetime.now()
 
-    # Оновлення: вибираємо тільки активні джерела
     active_sources = [url for url in Config.SOURCES if urlparse(url).netloc.replace('www.', '') not in bot_state.disabled_sources]
     
     num_sources_to_fetch = min(Config.NUM_SOURCES_TO_FETCH, len(active_sources)) 
@@ -423,121 +658,18 @@ async def fetch_all_sources():
                 all_news.extend(news_list)
 
     duration = (datetime.now() - start_time).total_seconds()
-    logger.info(f"📰 Знайдено {len(all_news)} новин з {len(selected_sources)} джерел за {duration:.2f} сек.")
-    
     return all_news, duration
 
-# --- 5. ХЕЛПЕРИ ДЛЯ ЗОБРАЖЕНЬ ТА ТЕКСТУ ---
-
-def generate_hashtags(title: str, summary: str) -> str:
-    """Генерує до 3-х релевантних хештегів на основі ключових слів."""
-    text = (title + " " + summary).lower()
-    
-    # Розширений словник для хештегів: 'ключове_слово': 'хештег_без_пробілів'
-    keyword_map = {
-        'війна': '#Війна', 'рф': '#Війна', 'росія': '#Війна', 'обстріл': '#Війна', 'фронт': '#Фронт',
-        'зеленський': '#Зеленський', 'президент': '#Політика', 'парламент': '#Політика', 'рада': '#Політика',
-        'долар': '#Фінанси', 'гривня': '#Фінанси', 'банк': '#Фінанси', 'економіка': '#Економіка', 'ціни': '#Економіка',
-        'єс': '#Європа', 'сша': '#США', 'україна': '#Україна', 'київ': '#Київ',
-        'суд': '#Право', 'кримінал': '#Право', 'поліція': '#Право', 'закон': '#Право',
-        'технології': '#Техно', 'наука': '#Наука', 'медицина': '#Медицина'
-    }
-    
-    # Використовуємо set для уникнення дублікатів і гарантії унікальності
-    found_hashtags = set()
-    
-    for keyword, hashtag in keyword_map.items():
-        # Регулярний вираз для пошуку слова, що закінчується на ключове слово (у різних відмінках)
-        # Наприклад, 'війні', 'війною' тощо.
-        if re.search(r'\b' + re.escape(keyword) + r'\w*\b', text): 
-            found_hashtags.add(hashtag)
-        
-        if len(found_hashtags) >= 3:
-            break
-            
-    return " ".join(list(found_hashtags))
-
-def get_post_emoji(hashtags: str) -> str:
-    """Вибирає тематичний емодзі для початку посту."""
-    if '#Війна' in hashtags: return '🛡️'
-    if '#Фінанси' in hashtags or '#Економіка' in hashtags: return '💰'
-    if '#Політика' in hashtags: return '🏛️'
-    if '#Європа' in hashtags or '#США' in hashtags: return '🌍'
-    return '📰'
-
-async def apply_watermark(image_url: str, text: str) -> BytesIO | None:
-    """Завантажує зображення, додає водяний знак і повертає його у форматі BytesIO."""
-    if not bot_state.watermark_enabled:
-        return None
-        
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(image_url, headers=Config.DEFAULT_HEADERS, timeout=Config.HTTP_TIMEOUT) as response:
-                response.raise_for_status()
-                image_bytes = await response.read()
-
-        img = Image.open(BytesIO(image_bytes)).convert("RGBA")
-        width, height = img.size
-
-        # Визначаємо розмір шрифту (1/20 від висоти зображення)
-        font_size = max(18, height // 20)
-        
-        try:
-            # Спроба завантажити професійний шрифт
-            font = ImageFont.truetype(FONT_PATH, font_size)
-        except IOError:
-            # Використання дефолтного шрифту, якщо професійний не знайдено
-            font = ImageFont.load_default()
-            logger.warning("❌ Не знайдено FONT_PATH. Використано дефолтний шрифт.")
-        
-        # Створення прозорого шару для водяного знаку
-        watermark_layer = Image.new('RGBA', (width, height), (255, 255, 255, 0))
-        draw = ImageDraw.Draw(watermark_layer)
-
-        # Визначення позиції (правий нижній кут)
-        text_bbox = draw.textbbox((0, 0), text, font=font)
-        text_width = text_bbox[2] - text_bbox[0]
-        text_height = text_bbox[3] - text_bbox[1]
-        
-        margin = 10
-        position = (width - text_width - margin, height - text_height - margin)
-
-        # Малюємо контур (тінь) для кращої читабельності
-        shadow_color = (0, 0, 0, 150) # Напівпрозорий чорний
-        main_color = (255, 255, 255, 255) # Білий
-        
-        # Додавання тіні
-        for offset in [(1, 1), (-1, 1), (1, -1), (-1, -1)]:
-            draw.text((position[0] + offset[0], position[1] + offset[1]), text, font=font, fill=shadow_color)
-            
-        # Додавання основного тексту
-        draw.text(position, text, font=font, fill=main_color)
-
-        # Комбінування зображення та водяного знаку
-        watermarked_img = Image.alpha_composite(img.convert('RGBA'), watermark_layer)
-        watermarked_img = watermarked_img.convert("RGB") # Telegram не підтримує PNG з альфа-каналом для photo
-
-        # Збереження у BytesIO
-        output = BytesIO()
-        watermarked_img.save(output, format="JPEG", quality=90)
-        output.seek(0)
-        return output
-
-    except Exception as e:
-        logger.error(f"❌ Помилка обробки Watermark для {image_url}: {e}")
-        return None
-
-# --- 6. ФОРМАТУВАННЯ ТА ПОСТИНГ ---
+# --- 5. ФОРМАТУВАННЯ ТА ПОСТИНГ ---
 
 def format_news_post(news_item: dict) -> str:
-    """Форматує новину для публікації у Telegram (HTML) з часом публікації, CTA та хештегами."""
+    """Форматує новину для публікації у Telegram (HTML) з часом, CTA та хештегами."""
     source_display = news_item['source'].replace('https://', '').replace('http://', '')
     published_time_str = news_item['published_at'].strftime(TIME_FORMAT)
     
     hashtags = generate_hashtags(news_item['title'], news_item['summary'])
     emoji = get_post_emoji(hashtags)
     
-    # Використання f-рядків для кращої читабельності
     message = (
         f"{emoji} <b>{news_item['title']}</b>\n\n"
         f"{news_item['summary']}\n\n"
@@ -583,28 +715,25 @@ async def send_news_to_channel(news_to_post: list):
                     chat_id=CHANNEL_ID,
                     photo=types.BufferedInputFile(watermarked_photo.getvalue(), filename="news_photo.jpg"),
                     caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    disable_notification=False 
+                    parse_mode=ParseMode.HTML
                 )
                 post_successful = True
             elif image_url:
-                # Якщо Watermark не вдалося накласти, спробуємо оригінальний URL
+                # 3. Якщо Watermark не вдався, спробуємо оригінальний URL
                 await bot.send_photo(
                     chat_id=CHANNEL_ID,
                     photo=image_url,
                     caption=caption,
-                    parse_mode=ParseMode.HTML,
-                    disable_notification=False
+                    parse_mode=ParseMode.HTML
                 )
                 post_successful = True
             
-            # Якщо немає фото, або обидві спроби з фото провалилися, надсилаємо ТЕКСТ
-            if not post_successful and (not image_url or image_url): # Використовуємо останній 'else' для текстового посту
+            # 4. Якщо немає фото, або обидві спроби з фото провалилися, надсилаємо ТЕКСТ
+            if not post_successful:
                  await bot.send_message(
                     chat_id=CHANNEL_ID,
                     text=caption,
-                    parse_mode=ParseMode.HTML,
-                    disable_notification=False
+                    parse_mode=ParseMode.HTML
                 )
                  post_successful = True
                  logger.warning(f"-> Опубліковано як ТЕКСТ через відсутність/помилку фото: {news['title'][:50]}...")
@@ -617,18 +746,16 @@ async def send_news_to_channel(news_to_post: list):
         except TelegramAPIError as e:
             logger.error(f"❌ Telegram API Error для '{news['title'][:50]}...': {e.message}")
             if "Too Many Requests" in e.message:
-                # Автоматичне очікування, якщо Telegram просить
                 wait_time = int(re.search(r'retry after (\d+)', e.message).group(1)) if re.search(r'retry after (\d+)', e.message) else 30
                 logger.warning(f"-> Telegram попросив зачекати {wait_time} сек. Чекаємо...")
                 await asyncio.sleep(wait_time)
             
-            # Позначаємо як опубліковану (навіть при помилці фото), щоб не спамити.
+            # Якщо проблема з фото, все одно позначаємо як опубліковану, щоб не спамити.
             if "Bad Request: failed to get HTTP URL content" in e.message or "Bad Request: PHOTO_INVALID" in e.message:
-                logger.warning("-> Проблема з URL/форматом зображення. Позначаємо як опубліковану.")
                 posted_urls.append(news['url']) 
-                continue # Переходимо до наступної новини
+                continue 
             
-            continue # Для інших помилок (не flood wait), просто переходимо до наступної новини
+            continue
             
         except Exception as e:
             await send_admin_notification(
@@ -642,31 +769,30 @@ async def send_news_to_channel(news_to_post: list):
 async def send_daily_digest():
     """Публікує щоденний дайджест о 21:00."""
     
-    # 1. Отримуємо новини для дайджесту
     news_list = await get_daily_digest_news(Config.DAILY_DIGEST_LIMIT)
     
     if not news_list:
         logger.info("ℹ️ Немає новин для щоденного дайджесту.")
         return
 
-    # 2. Форматуємо та надсилаємо
     digest_message = format_digest_post(news_list)
     try:
         await bot.send_message(
             chat_id=CHANNEL_ID,
             text=digest_message,
-            parse_mode=ParseMode.HTML,
-            disable_notification=False 
+            parse_mode=ParseMode.MARKDOWN # Використовуємо Markdown для Дайджесту, щоб заголовок був жирним
         )
-        # 3. Позначаємо як опубліковані
         digest_urls = [news['url'] for news in news_list]
         await mark_news_as_posted(digest_urls, is_digested=True)
         
         await send_admin_notification(
             f"✅ **Дайджест успішно надіслано**: Опубліковано {len(news_list)} новин.", is_error=False
         )
-        logger.info(f"🏆 Щоденний дайджест успішно надіслано ({len(news_list)} новин).")
         
+        # Оновлюємо дату останнього дайджесту в стані та БД
+        bot_state.last_digest_date = datetime.now(KYIV_TZ).date()
+        await save_bot_state_to_db()
+
     except TelegramAPIError as e:
         logger.error(f"❌ Помилка Telegram при відправці дайджесту: {e.message}")
         await send_admin_notification(
@@ -674,9 +800,6 @@ async def send_daily_digest():
         )
     except Exception as e:
         logger.critical(f"❌ Критична помилка в логіці дайджесту: {e}")
-        await send_admin_notification(
-            f"❌ Критична помилка в логіці дайджесту: {type(e).__name__}", is_error=True
-        )
 
 
 async def send_admin_notification(message: str, is_error: bool = False):
@@ -692,13 +815,12 @@ async def send_admin_notification(message: str, is_error: bool = False):
     except Exception as e:
         logger.error(f"Не вдалося надіслати сповіщення адміну: {e}")
 
-# --- 7. ОСНОВНИЙ ЦИКЛ АВТОПОСТИНГУ ---
+# --- 6. ОСНОВНИЙ ЦИКЛ АВТОПОСТИНГУ ---
 
 async def db_cleanup_loop():
     """Асинхронний цикл для періодичного очищення бази даних."""
     while True:
         await asyncio.sleep(Config.CLEANUP_INTERVAL_HOURS * 3600) 
-        logger.info("--- ♻️ Запуск фонової очистки БД ---")
         await cleanup_db()
 
 async def auto_posting_loop(bot: Bot):
@@ -708,17 +830,12 @@ async def auto_posting_loop(bot: Bot):
         
         # 1. Перевірка та запуск щоденного дайджесту
         if now_kyiv.hour == Config.DAILY_DIGEST_HOUR and now_kyiv.date() > bot_state.last_digest_date:
-            logger.info("--- 🏆 Час щоденного дайджесту ---")
             await send_daily_digest()
-            bot_state.last_digest_date = now_kyiv.date()
         
         try:
-            logger.info("--- 🚀 Запуск циклу автопостингу ---")
-            
-            # 2. Парсинг і збереження новин
+            # 2. Парсинг і збереження новин (використовуємо тут fetch_interval_min, хоча по факту це не впливає на posting_loop)
             fetched_news, parse_duration = await fetch_all_sources()
             new_count = await save_news_to_db(fetched_news)
-            logger.info(f"💾 Успішно вставлено {new_count} новин.")
 
             # 3. Отримуємо ТОП-3 новини
             news_to_post = await get_unique_news_from_db(Config.MAX_NEWS_PER_CYCLE)
@@ -740,19 +857,18 @@ async def auto_posting_loop(bot: Bot):
 
         # 5. Очікування на основі динамічного інтервалу
         await asyncio.sleep(bot_state.posting_interval_min * 60)
-        logger.info(f"Очікування {bot_state.posting_interval_min} хвилин...")
 
-# --- 8. КОМАНДИ АДМІНІСТРАТОРА (ДИНАМІЧНЕ КЕРУВАННЯ) ---
+# --- 7. КОМАНДИ АДМІНІСТРАТОРА (З КЕРУВАННЯМ СТАНОМ) ---
 
 async def cmd_status(message: types.Message):
-    """Показує поточний статус бота та конфігурацію."""
+    """/status - Показує поточний статус бота та конфігурацію."""
     stats = await get_db_stats()
     stats_text = (
         f"• 📝 Всього новин у DB: {stats.get('total_news', 0)}\n"
         f"• ✅ Опубліковано: {stats.get('posted_news', 0)}\n"
         f"• 🏆 У дайджесті: {stats.get('digested_news', 0)}\n"
         f"• 📦 У черзі (З ФОТО): {stats.get('unposted_photo_news', 0)}\n"
-        f"• 📰 Активних джерел: {stats.get('total_sources', 0)}"
+        f"• 📰 Унікальних джерел у DB: {stats.get('total_sources', 0)}"
     ) if stats else "❌ Не вдалося отримати статистику з бази даних."
     
     disabled_sources_list = "\n".join([f"   - {d}" for d in bot_state.disabled_sources]) if bot_state.disabled_sources else "   - (Немає)"
@@ -760,52 +876,52 @@ async def cmd_status(message: types.Message):
     config_msg = (
         "<b>🤖 Статус Платформи Новин (Професійний режим):</b>\n\n"
         "<b>⚙️ Конфігурація (Динамічна):</b>\n"
-        f"  ⏳ Інтервал Парсингу: {bot_state.fetch_interval_min} хв\n"
+        f"  ⏳ Інтервал Парсингу: {Config.FETCH_INTERVAL_MIN} хв (Фікс.)\n"
         f"  ⏳ Інтервал Постингу: <b>{bot_state.posting_interval_min} хв</b>\n"
-        f"  ⏱️ Макс. вік новини: {Config.MAX_AGE_MIN} хв\n"
-        f"  📝 Макс. постів за цикл: <b>{Config.MAX_NEWS_PER_CYCLE} (ТОП-3)</b>\n"
+        f"  📝 Макс. постів за цикл: <b>{Config.MAX_NEWS_PER_CYCLE}</b>\n"
         f"  🏆 Дайджест: {Config.DAILY_DIGEST_HOUR}:00 ({Config.DAILY_DIGEST_LIMIT} новин)\n"
         f"  🖼️ Watermark: {'✅ УВІМКНЕНО' if bot_state.watermark_enabled else '❌ ВИМКНЕНО'} (Текст: <code>{bot_state.watermark_text}</code>)\n"
         f"  ✍️ CTA: <code>{bot_state.cta_text}</code>\n"
         f"  🚫 Вимкнені джерела:\n{disabled_sources_list}\n\n"
         "<b>📊 Статистика Бази Даних:</b>\n"
-        f"{stats_text}\n\n"
-        "<b>🔑 Сервісні параметри:</b>\n"
-        f"  📢 Channel ID: <code>{CHANNEL_ID}</code>"
+        f"{stats_text}"
     )
     await message.answer(config_msg, parse_mode=ParseMode.HTML)
 
-async def cmd_forcepost(message: types.Message):
-    """Примусово запускає цикл парсингу та постингу."""
-    await message.answer("♻️ Примусовий запуск циклу парсингу...")
-    
-    # Використовуємо окрему функцію для запуску в окремому завданні
-    async def run_once(bot_instance):
-        try:
-            start_time = datetime.now()
-            fetched_news, parse_duration = await fetch_all_sources()
-            new_count = await save_news_to_db(fetched_news)
-            
-            news_to_post = await get_unique_news_from_db(Config.MAX_NEWS_PER_CYCLE) 
-            
-            post_start_time = datetime.now()
-            posted_count = await send_news_to_channel(news_to_post)
-            post_duration = (datetime.now() - post_start_time).total_seconds()
-            
-            result_msg = (
-                "✅ <b>Цикл примусового постингу завершено!</b>\n"
-                f"   • Знайдено нових новин: {new_count}\n"
-                f"   • Опубліковано новин: {posted_count}\n"
-                f"   • Таймінг (Парсинг): {parse_duration:.2f} сек\n"
-                f"   • Таймінг (Постинг): {post_duration:.2f} сек"
-            )
-        except Exception as e:
-            result_msg = f"❌ <b>Критична помилка примусового постингу:</b> {e}"
-            logger.critical(result_msg)
-        
-        await bot_instance.send_message(message.chat.id, result_msg, parse_mode=ParseMode.HTML)
 
-    asyncio.create_task(run_once(bot)) # Запуск як окреме завдання
+async def cmd_reboot(message: types.Message):
+    """/reboot - Примусово перезавантажує динамічний стан з БД (перевірка персистенції)."""
+    await message.answer("⚠️ Симуляція перезавантаження. Завантаження стану з БД...")
+    
+    global bot_state
+    temp_bot_state = BotState() 
+    await load_bot_state_from_db()
+    
+    await message.answer("✅ Динамічний стан успішно перезавантажено. Перевірте <code>/status</code>.", parse_mode=ParseMode.HTML)
+
+
+async def cmd_sources(message: types.Message):
+    """/sources - Показує всі джерела та їхній поточний статус."""
+    sources_msg = "<b>📰 Керування Джерелами Новин:</b>\n\n"
+    
+    active_sources = []
+    disabled_sources = []
+    
+    for url in Config.SOURCES:
+        domain = urlparse(url).netloc.replace('www.', '')
+        line = f"<code>{domain}</code>"
+        
+        if domain in bot_state.disabled_sources:
+            disabled_sources.append(line)
+        else:
+            active_sources.append(line)
+
+    sources_msg += f"<b>✅ Активні ({len(active_sources)}):</b>\n" + "\n".join(active_sources) + "\n\n"
+    sources_msg += f"<b>🚫 Вимкнені ({len(disabled_sources)}):</b>\n" + "\n".join(disabled_sources) + "\n\n"
+    
+    sources_msg += "Використовуйте <code>/toggle_source domain.com</code> для керування."
+    
+    await message.answer(sources_msg, parse_mode=ParseMode.HTML)
 
 
 async def cmd_set_watermark(message: types.Message):
@@ -817,6 +933,7 @@ async def cmd_set_watermark(message: types.Message):
             return
 
         bot_state.watermark_text = new_text
+        await save_bot_state_to_db() 
         await message.answer(f"✅ Текст водяного знаку змінено на: <code>{new_text}</code>", parse_mode=ParseMode.HTML)
     except IndexError:
         await message.answer("❌ Використання: <code>/set_watermark @NewChannelName</code>", parse_mode=ParseMode.HTML)
@@ -824,6 +941,7 @@ async def cmd_set_watermark(message: types.Message):
 async def cmd_toggle_watermark(message: types.Message):
     """/toggle_watermark - Вмикає/вимикає водяні знаки."""
     bot_state.watermark_enabled = not bot_state.watermark_enabled
+    await save_bot_state_to_db() 
     status = "УВІМКНЕНО" if bot_state.watermark_enabled else "ВИМКНЕНО"
     await message.answer(f"✅ Водяні знаки тепер: <b>{status}</b>", parse_mode=ParseMode.HTML)
 
@@ -836,6 +954,7 @@ async def cmd_set_cta(message: types.Message):
             return
 
         bot_state.cta_text = new_text
+        await save_bot_state_to_db() 
         await message.answer(f"✅ Текст заклику до дії (CTA) змінено на: <i>{new_text}</i>", parse_mode=ParseMode.HTML)
     except IndexError:
         await message.answer("❌ Використання: <code>/set_cta 👉 Підписатись на @MyChannel</code>", parse_mode=ParseMode.HTML)
@@ -854,8 +973,8 @@ async def cmd_set_interval(message: types.Message):
             await message.answer("❌ Інтервал має бути не менше 1 хвилини.")
             return
 
-        # bot_state.fetch_interval_min = fetch_interval # Парсинг лишаємо в config
         bot_state.posting_interval_min = posting_interval
+        await save_bot_state_to_db()
 
         await message.answer(
             f"✅ Інтервал постингу змінено на: <b>{posting_interval} хв</b>\n"
@@ -882,9 +1001,42 @@ async def cmd_toggle_source(message: types.Message):
             bot_state.disabled_sources.add(source_domain)
             status = "ВИМКНЕНО"
             
+        await save_bot_state_to_db()
         await message.answer(f"✅ Джерело <b>{source_domain}</b> тепер: <b>{status}</b>", parse_mode=ParseMode.HTML)
     except IndexError:
         await message.answer("❌ Використання: <code>/toggle_source pravda.com.ua</code>", parse_mode=ParseMode.HTML)
+
+async def cmd_forcepost(message: types.Message):
+    """/forcepost - Примусово запускає цикл парсингу та постингу."""
+    await message.answer("♻️ Примусовий запуск циклу парсингу...")
+    
+    async def run_once(bot_instance):
+        try:
+            start_time = datetime.now()
+            fetched_news, parse_duration = await fetch_all_sources()
+            new_count = await save_news_to_db(fetched_news)
+            
+            news_to_post = await get_unique_news_from_db(Config.MAX_NEWS_PER_CYCLE) 
+            
+            post_start_time = datetime.now()
+            posted_count = await send_news_to_channel(news_to_post)
+            post_duration = (datetime.now() - post_start_time).total_seconds()
+            
+            result_msg = (
+                "✅ <b>Цикл примусового постингу завершено!</b>\n"
+                f"   • Знайдено нових новин: {new_count}\n"
+                f"   • Опубліковано новин: {posted_count}\n"
+                f"   • Таймінг (Парсинг): {parse_duration:.2f} сек\n"
+                f"   • Таймінг (Постинг): {post_duration:.2f} сек"
+            )
+        except Exception as e:
+            result_msg = f"❌ <b>Критична помилка примусового постингу:</b> {e}"
+            logger.critical(result_msg)
+        
+        await bot_instance.send_message(message.chat.id, result_msg, parse_mode=ParseMode.HTML)
+
+    asyncio.create_task(run_once(bot)) 
+
 
 async def cmd_queue(message: types.Message):
     """/queue - Показує кількість новин з фото, що очікують на публікацію."""
@@ -892,14 +1044,13 @@ async def cmd_queue(message: types.Message):
     unposted_count = stats.get('unposted_photo_news', 0) if stats else 0
     await message.answer(f"📦 <b>У черзі</b> на публікацію (з фото): <b>{unposted_count}</b> новин.", parse_mode=ParseMode.HTML)
 
-
-# --- 9. ЗАПУСК БОТА ---
+# --- 8. ЗАПУСК БОТА ---
 
 async def main():
     """Основна функція для ініціалізації та запуску бота."""
     
-    if not all([BOT_TOKEN, DATABASE_URL, CHANNEL_ID]):
-        logger.critical("Критична помилка: Не задані BOT_TOKEN, DATABASE_URL або CHANNEL_ID.")
+    if not all([BOT_TOKEN, DATABASE_URL, CHANNEL_ID, ADMIN_ID]):
+        logger.critical("Критична помилка: Не задані BOT_TOKEN, DATABASE_URL, CHANNEL_ID або ADMIN_ID.")
         return
 
     await connect_db()
@@ -908,6 +1059,7 @@ async def main():
         return
 
     await init_db()
+    await load_bot_state_from_db() # 💡 ЗАВАНТАЖЕННЯ ДИНАМІЧНОГО СТАНУ ПРИ СТАРТІ
 
     global bot
     bot = Bot(
@@ -918,17 +1070,21 @@ async def main():
     global dp
     dp = Dispatcher()
     
-    # Реєстрація команд адміністратора
     admin_filter = F.from_user.id == ADMIN_ID
+    
+    # Реєстрація команд адміністратора
     dp.message.register(cmd_status, Command("status"), admin_filter)
     dp.message.register(cmd_forcepost, Command("forcepost"), admin_filter)
-    dp.message.register(cmd_stats, Command("stats"), admin_filter)
+    dp.message.register(cmd_queue, Command("queue"), admin_filter)
+    dp.message.register(cmd_sources, Command("sources"), admin_filter) 
+    dp.message.register(cmd_reboot, Command("reboot"), admin_filter) 
+    
+    # Команди, що зберігають стан
     dp.message.register(cmd_set_watermark, Command("set_watermark"), admin_filter)
     dp.message.register(cmd_toggle_watermark, Command("toggle_watermark"), admin_filter)
     dp.message.register(cmd_set_cta, Command("set_cta"), admin_filter)
     dp.message.register(cmd_set_interval, Command("set_interval"), admin_filter)
     dp.message.register(cmd_toggle_source, Command("toggle_source"), admin_filter)
-    dp.message.register(cmd_queue, Command("queue"), admin_filter)
 
     asyncio.create_task(auto_posting_loop(bot))
     asyncio.create_task(db_cleanup_loop())
