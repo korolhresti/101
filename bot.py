@@ -11,7 +11,7 @@ from typing import List, Optional, Dict, Any
 import asyncpg
 import aiohttp
 from aiohttp import ClientSession, web
-from aiogram import Bot, Dispatcher, Router, types # Router імпортовано
+from aiogram import Bot, Dispatcher, Router, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
@@ -165,31 +165,31 @@ async def get_user_preference(pool: asyncpg.Pool, chat_id: int) -> Optional[str]
 
 @router.message(Command("start"))
 async def command_start_handler(message: types.Message, pool: asyncpg.Pool) -> None:
-    """Обробляє команду /start, підписує користувача та пропонує обрати preferred стиль."""
+    """Обробляє команду /start, реєструє користувача та пропонує обрати preferred стиль."""
     chat_id = message.chat.id
     try:
-        # Вставка або оновлення підписки
+        # Вставка або оновлення реєстрації
         await pool.execute(
             "INSERT INTO subscribers (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING",
             chat_id
         )
         await message.answer(
             "**👋 Ласкаво просимо до Професійної Аналітики!**\n\n"
-            "Ви успішно підписалися на щогодинну аналітику від експертів\\-ШІ\\.\n"
-            "Оберіть ваш preferred стиль новин:",
+            "Ви можете миттєво генерувати аналітику та ставити питання експерту\\-ШІ\\.\n"
+            "Оберіть ваш preferred стиль аналітики:",
             reply_markup=get_preference_keyboard(),
             parse_mode=ParseMode.MARKDOWN_V2
         )
     except Exception as e:
-        logger.error(f"Помилка підписки користувача {chat_id}: {e}")
-        await message.answer("❌ Виникла помилка при оформленні підписки\\. Спробуйте пізніше\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        logger.error(f"Помилка реєстрації користувача {chat_id}: {e}")
+        await message.answer("❌ Виникла помилка при реєстрації\\. Спробуйте пізніше\\.", parse_mode=ParseMode.MARKDOWN_V2)
 
 @router.message(Command("settings"))
 async def command_settings_handler(message: types.Message) -> None:
     """Дозволяє користувачу змінити свій preferred стиль."""
     await message.answer(
         "**⚙️ Налаштування Експерта**\n\n"
-        "Оберіть preferred стиль новин для щогодинної розсилки та миттєвих запитів \\(/news, /ask\\):",
+        "Оберіть preferred стиль новин для миттєвих запитів \\(/news, /ask\\):",
         reply_markup=get_preference_keyboard(),
         parse_mode=ParseMode.MARKDOWN_V2
     )
@@ -234,7 +234,7 @@ async def command_news_handler(message: types.Message, pool: asyncpg.Pool, bot: 
     
     preference = await get_user_preference(pool, chat_id)
     if not preference:
-        await message.answer("Ви не підписані або не обрали preferred стиль\\. Виконайте команду /start\\.", parse_mode=ParseMode.MARKDOWN_V2)
+        await message.answer("Ви не зареєстровані або не обрали preferred стиль\\. Виконайте команду /start\\.", parse_mode=ParseMode.MARKDOWN_V2)
         return
 
     await bot.send_chat_action(chat_id, "typing")
@@ -260,7 +260,7 @@ async def command_ask_handler(message: types.Message, state: FSMContext, pool: a
     preference = await get_user_preference(pool, chat_id)
     
     if not preference:
-        await message.answer("Ви не підписані\\. Виконайте команду /start, щоб розпочати.", parse_mode=ParseMode.MARKDOWN_V2)
+        await message.answer("Ви не зареєстровані\\. Виконайте команду /start, щоб розпочати.", parse_mode=ParseMode.MARKDOWN_V2)
         return
     
     # Скидаємо будь-яку стару історію, щоб почати нову консультацію
@@ -333,7 +333,8 @@ async def process_expert_question(message: types.Message, state: FSMContext, poo
         chat_history.append(new_user_message)
         
         # Важливо: Gemini API повертає text з джерелами. Для історії чату ми зберігаємо лише текст моделі.
-        model_text_only = response_text.split("***")[0].strip() 
+        # Регулярний вираз для видалення джерел (тексту після "***")
+        model_text_only = re.split(r'\*\*\*|Джерела', response_text, maxsplit=1)[0].strip()
         new_model_response = {
             "role": "model",
             "parts": [{ "text": model_text_only }]
@@ -373,11 +374,10 @@ async def command_help_handler(message: types.Message) -> None:
         "**🤖 Професійна Аналітика — Ваш Експертний Бот**\n\n"
         "Цей бот надає глибоку аналітику, змодельовану на основі стилів відомих експертів \\(Портников/Лібсіц\\) із залученням актуальних даних \\(Google Search Grounding\\) та економічних показників\\.\n\n"
         "**Доступні команди:**\n"
-        "• `/start` \\- Підписатися та обрати preferred стиль.\n"
+        "• `/start` \\- Розпочати роботу та обрати preferred стиль.\n"
         "• `/news` \\- Отримати свіжу аналітику негайно \\(відповідно до вашого preferred стилю та останніх економічних даних\\).\n"
         "• `/settings` \\- Змінити ваш preferred стиль новин.\n"
         "• `/ask` \\- Розпочати багатоходову консультацію з експертом \\(діалог з пам'яттю контексту\\).\n"
-        "• `/stop` \\- Скасувати підписку на щогодинну розсилку.\n"
         "• `/help` \\- Показати цю довідку.\n"
         "• `/cancel` \\- Скасувати поточну операцію \\(наприклад, під час `/ask`\\)."
     )
@@ -386,26 +386,9 @@ async def command_help_handler(message: types.Message) -> None:
     await message.answer(help_text, parse_mode=ParseMode.MARKDOWN_V2)
 
 
-@router.message(Command("stop"))
-async def command_stop_handler(message: types.Message, pool: asyncpg.Pool) -> None:
-    """Обробляє команду /stop та відписує користувача."""
-    chat_id = message.chat.id
-    try:
-        result = await pool.execute(
-            "DELETE FROM subscribers WHERE chat_id = $1",
-            chat_id
-        )
-        if result.split()[-1] == '1':
-            await message.answer("Ви успішно відписалися від розсилки.")
-        else:
-            await message.answer("Ви не були підписані на розсилку.")
-    except Exception as e:
-        logger.error(f"Помилка відписки користувача {chat_id}: {e}")
-        await message.answer("Виникла помилка при скасуванні підписки. Спробуйте пізніше.")
-
 @router.message(Command("stats"))
 async def command_stats_handler(message: types.Message, pool: asyncpg.Pool) -> None:
-    """Обробляє команду /stats (для адміна) та показує статистику підписників."""
+    """Обробляє команду /stats (для адміна) та показує статистику зареєстрованих користувачів."""
     chat_id = message.chat.id
     
     if chat_id != ADMIN_ID:
@@ -421,7 +404,7 @@ async def command_stats_handler(message: types.Message, pool: asyncpg.Pool) -> N
         
         await message.answer(
             f"\\*\\*📊 Статистика Платформи\\*\\*\n"
-            f"Всього підписників: `{count}`\n"
+            f"Всього зареєстрованих користувачів: `{count}`\n"
             f"Активних за 7 днів: `{active_count}`",
             parse_mode=ParseMode.MARKDOWN_V2
         )
@@ -430,16 +413,7 @@ async def command_stats_handler(message: types.Message, pool: asyncpg.Pool) -> N
         await message.answer("Виникла помилка при отриманні статистики.")
 
 
-# --- 6. ФУНКЦІЇ ДЛЯ ГЕНЕРАЦІЇ ТА РОЗСИЛКИ НОВИН (GEMINI API) ---
-
-async def get_subscribers(pool: asyncpg.Pool) -> List[int]:
-    """Отримує список усіх підписаних chat ID."""
-    try:
-        records = await pool.fetch("SELECT chat_id FROM subscribers")
-        return [r['chat_id'] for r in records]
-    except Exception as e:
-        logger.error(f"Помилка отримання підписників з DB: {e}")
-        return []
+# --- 6. ФУНКЦІЇ ДЛЯ ГЕНЕРАЦІЇ НОВИН (GEMINI API) ---
 
 async def call_gemini_api(session: ClientSession, contents_list: List[Dict[str, Any]], system_prompt: Optional[str] = None) -> Optional[str]:
     """
@@ -548,62 +522,6 @@ async def generate_expert_news(session: ClientSession, economic_engine: 'Economi
     
     return None
 
-async def news_poster(app: web.Application):
-    """Фонове завдання, що генерує та публікує новини щогодини."""
-    bot: Bot = app['bot']
-    pool: asyncpg.Pool = app['pool']
-    session: ClientSession = app['session']
-    economic_engine: 'EconomicEngine' = app['economic_engine'] # Отримуємо інстанс EconomicEngine
-    
-    logger.info("Запуск завдання щогодинної розсилки новин.")
-    
-    await asyncio.sleep(5) 
-
-    while True:
-        try:
-            # 1. Розрахунок часу
-            now = datetime.now(KYIV_TZ)
-            next_hour = (now + timedelta(hours=1)).replace(minute=0, second=5, microsecond=0, tzinfo=KYIV_TZ)
-            wait_seconds = (next_hour - now).total_seconds()
-            
-            if wait_seconds < 0:
-                 next_hour = (now + timedelta(hours=2)).replace(minute=0, second=5, microsecond=0, tzinfo=KYIV_TZ)
-                 wait_seconds = (next_hour - now).total_seconds()
-            
-            logger.info(f"Очікування {wait_seconds:.0f} секунд до наступного запуску ({next_hour.strftime('%H:%M:%S')}).")
-            await asyncio.sleep(wait_seconds)
-
-            # 2. Generate News (передаємо сесію та двигун)
-            logger.info("Час прийшов. Запуск генерації новин...")
-            news_message = await generate_expert_news(session, economic_engine, expert_choice=None) 
-            
-            if news_message:
-                # 3. Get Subscribers
-                subscribers = await get_subscribers(pool)
-                logger.info(f"Новина згенерована. Знайдено {len(subscribers)} підписників.")
-
-                # 4. Send News
-                for chat_id in subscribers:
-                    try:
-                        await bot.send_message(
-                            chat_id=chat_id, 
-                            text=news_message, 
-                            parse_mode=ParseMode.MARKDOWN_V2 
-                        )
-                        await asyncio.sleep(0.05) 
-                    except Exception as e:
-                        logger.error(f"Не вдалося надіслати новину користувачу {chat_id}: {e}")
-                
-            else:
-                logger.warning("Генерація новин не вдалася або повернула порожній вміст.")
-
-        except asyncio.CancelledError:
-            logger.info("Завдання розсилки новин скасовано.")
-            break
-        except Exception as e:
-            logger.critical(f"Критична помилка в циклі news_poster: {e}")
-            await asyncio.sleep(60) 
-
 
 # --- 7. КОНФІГУРАЦІЯ WEBHOOK I SERVER ---
 
@@ -663,9 +581,8 @@ async def on_startup(app: web.Application):
     except Exception as e:
         logger.critical(f"Критична помилка встановлення Webhook: Telegram server says - {e}")
 
-    # 3. Запуск фонового завдання для розсилки новин
-    app['news_task'] = asyncio.create_task(news_poster(app))
-    
+    # Фонове завдання щогодинної розсилки було видалено на запит користувача.
+
     
 async def on_shutdown(app: web.Application):
     """Дії, що виконуються при зупинці додатка."""
@@ -675,20 +592,16 @@ async def on_shutdown(app: web.Application):
     
     logger.info("Запуск on_shutdown...")
     
-    # 1. Вимкнення фонового завдання
-    if 'news_task' in app:
-        app['news_task'].cancel()
-        await asyncio.gather(app['news_task'], return_exceptions=True)
-        logger.info("Фонове завдання news_poster скасовано.")
+    # Фонове завдання щогодинної розсилки було видалено на запит користувача.
     
-    # 2. Видалення Webhook
+    # 1. Видалення Webhook
     try:
         await bot.delete_webhook()
         logger.info("Webhook успішно видалено.")
     except Exception as e:
         logger.warning(f"Помилка видалення Webhook: {e}")
         
-    # 3. Закриття HTTP сесії та пулу DB
+    # 2. Закриття HTTP сесії та пулу DB
     await session.close()
     await pool.close()
     logger.info("HTTP сесія та пул DB закриті.")
@@ -749,6 +662,7 @@ async def main():
     
     await site.start()
     
+    # Нескінченний цикл для підтримки роботи сервера
     while True:
         await asyncio.sleep(3600) 
 
