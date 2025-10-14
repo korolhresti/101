@@ -70,9 +70,11 @@ class GeminiClient:
 
     async def _call_api(self, prompt: str, system_instruction: str) -> Optional[str]:
         """Універсальний метод для виклику Gemini API."""
+        
+        # ВИПРАВЛЕНО СИНТАКСИЧНУ ПОМИЛКУ у словнику payload
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "systemInstruction": {"parts": [{"text: system_instruction}]}},
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
             "tools": [{"google_search": {}}], # Заземлення через Google Search для актуальності
         }
         
@@ -183,6 +185,7 @@ async def unsubscribe_user(pool: asyncpg.Pool, user_id: int) -> bool:
     """Видаляє користувача з підписників."""
     try:
         result = await pool.execute("DELETE FROM subscribers WHERE user_id = $1", user_id)
+        # asyncpg повертає рядок з кількістю видалених рядків, наприклад 'DELETE 1'
         return result == 'DELETE 1'
     except Exception as e:
         logger.error(f"Помилка відписки користувача {user_id}: {e}")
@@ -297,11 +300,13 @@ async def process_and_publish_news(bot: Bot, pool: asyncpg.Pool, session: Client
         except ValueError:
             # На випадок, якщо AI не дотрималося формату
             summary = engagement_text
-            engagement_question = ""
+            engagement_question = "Яка ваша думка щодо цього?"
+            logger.warning("AI не надало дискусійне питання. Використано стандартне.")
         
         # Хештеги
         hashtag_line = f"\n\n**Хештеги:** {hashtags}" if hashtags else ""
 
+        # УВАГА: Telegram-боти мають обмеження на довжину повідомлень.
         message_text = (
             f"**📰 TOP НОВИНА:** {item.title}\n\n"
             f"{summary}\n\n"
@@ -315,6 +320,7 @@ async def process_and_publish_news(bot: Bot, pool: asyncpg.Pool, session: Client
         
         for user_id in subscribers:
             try:
+                # Оновлено ParseMode на MARKDOWN, щоб використовувати **жирний**
                 await bot.send_message(
                     chat_id=user_id,
                     text=message_text,
@@ -413,6 +419,7 @@ async def handle_general_text(message: types.Message):
 
 async def handle_webhook(request: web.Request):
     """Обробник вхідних POST-запитів від Telegram (webhook)."""
+    # Отримати ресурси, які були збережені в app
     bot: Bot = request.app["bot"]
     dp: Dispatcher = request.app["dp"]
     
@@ -458,8 +465,10 @@ async def on_shutdown(app: web.Application):
     await bot.delete_webhook()
 
     # 2. Зупинка фонового завдання
-    app["news_task"].cancel()
-    logger.info("Фонове завдання планувальника новин скасовано.")
+    # Перевірка, чи існує завдання перед скасуванням
+    if "news_task" in app and not app["news_task"].done():
+        app["news_task"].cancel()
+        logger.info("Фонове завдання планувальника новин скасовано.")
 
     # 3. Закриття HTTP-сесії
     await session.close()
@@ -498,8 +507,7 @@ async def main():
     app["session"] = session
 
     # 4. Реєстрація залежностей для хендлерів DP
-    # Це гарантує, що pool, session, і bot доступні у функціях-обробниках
-    # ВИПРАВЛЕНО: Використовуємо dp.update.middleware.register для ін'єкції ресурсів (замість застарілого .inject())
+    # Використовуємо .update.middleware.register для ін'єкції ресурсів у всі хендлери
     dp.update.middleware.register(lambda handler, event, data: {
         **data, 
         'pool': pool, 
@@ -522,8 +530,7 @@ async def main():
     
     await site.start()
 
-    # Нескінченний цикл для підтримки роботи сервера (поки не буде скасовано)
-    # Це важливо для коректної роботи aiohttp web runner в асинхронному контексті
+    # Нескінченний цикл для підтримки роботи сервера
     await asyncio.Event().wait() 
 
 if __name__ == '__main__':
