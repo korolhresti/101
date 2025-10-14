@@ -4,624 +4,526 @@ import logging
 import sys
 import json
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse, urljoin
 from typing import Dict, Any, List, Optional, Tuple
 
 import asyncpg
 import aiohttp
 from aiohttp import ClientSession, web
 import feedparser
-from aiogram import Bot, Dispatcher, types
+from bs4 import BeautifulSoup
+
+from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import Command, CommandStart
 from aiogram.client.default import DefaultBotProperties
-from aiogram.utils.deep_linking import create_start_link
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 
 # --- 1. НАЛАШТУВАННЯ СЕРЕДОВИЩА ТА ЛОГУВАННЯ ---
 
-# Константи
 KYIV_TZ = timezone(timedelta(hours=3), 'Europe/Kyiv')
-GEMINI_MODEL = "gemini-2.5-flash-preview-05-20"
-LLM_PROCESSING_BATCH_SIZE = 5 # Менша партія для більшої стабільності
-MAX_GEMINI_PRIORITY = 5
 
-# Логування
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+                    datefmt='%Y-%m-%d %H:%M:%S',
                     stream=sys.stdout)
 logger = logging.getLogger(__name__)
 
-# Змінні оточення (обов'язкові для продакшену)
+# Змінні оточення
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-NEWS_CHANNEL_ID = os.getenv("NEWS_CHANNEL_ID", "@your_channel_username_or_id") # Замініть на ваш ID/username
-POST_INTERVAL_MINUTES = int(os.getenv("POST_INTERVAL_MINUTES", 5))
-COLLECTION_INTERVAL_MINUTES = int(os.getenv("COLLECTION_INTERVAL_MINUTES", 20))
-LLM_PROCESSING_INTERVAL_MINUTES = int(os.getenv("LLM_PROCESSING_INTERVAL_MINUTES", 10))
+# Залишаємо GEMINI_API_KEY порожнім, якщо він не встановлений, Canvas надасть його автоматично.
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") 
 
-# Webhook Налаштування
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST") # Ваш публічний домен (обов'язково HTTPS)
+# Конфігурація Webhook для Render
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
 WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
 WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
+
+if not (BOT_TOKEN and WEBHOOK_HOST and DATABASE_URL):
+    logger.error("Критичні змінні оточення (BOT_TOKEN, WEBHOOK_HOST, DATABASE_URL) не встановлені.")
+    sys.exit(1)
+
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
-WEBHOOK_URL = f"{WEBHOOK_HOST}{WEBHOOK_PATH}" if WEBHOOK_HOST else None
+WEBHOOK_URL = urljoin(WEBHOOK_HOST, WEBHOOK_PATH)
 
-# --- 2. КОНФІГУРАЦІЯ RSS ДЖЕРЕЛ ---
-# Вибір надійних та популярних українських джерел
-RSS_FEEDS = {
-    "Liga.net (Бізнес/Політика)": "https://www.liga.net/rss/all.xml",
-    "NV (Загальні/Громадські)": "https://nv.ua/rss/all.xml",
-    "Hromadske (Громадське)": "https://hromadske.ua/rss",
-    "Ukrinform (Державне)": "https://www.ukrinform.ua/rss/all.xml",
-}
+# Константа для новинного RSS-фіда (припустімо, це популярне українське ЗМІ)
+# УВАГА: Замініть на актуальну RSS-стрічку популярного ресурсу.
+NEWS_RSS_URL = "https://www.pravda.com.ua/rss/" # Приклад для УП
+NEWS_INTERVAL_SECONDS = 15 * 60 # Інтервал перевірки новин: 15 хвилин
+MAX_NEWS_TO_PROCESS = 3 # Максимальна кількість новин для обробки за один цикл
 
-# --- 3. СХЕМА БД ТА СТАТУСИ ---
+# --- 2. КЛАСИ ТА СЕРВІСИ ---
 
-class DBSchema:
-    """SQL-команди для ініціалізації схеми БД."""
-    
-    # Таблиця новин (з пріоритетом LLM)
-    CREATE_NEWS_TABLE = """
-        CREATE TABLE IF NOT EXISTS news (
-            id SERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            link TEXT UNIQUE NOT NULL,
-            source TEXT NOT NULL,
-            published_at TIMESTAMP WITH TIME ZONE NOT NULL,
-            saved_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-            llm_summary TEXT NULL,          -- Резюме від LLM
-            priority INTEGER DEFAULT 0,     -- Оцінка популярності/важливості (1-5)
-            status TEXT DEFAULT 'raw'       -- 'raw', 'llm_failed', 'ready', 'posted'
-        );
-    """
-    
-    # Таблиця опублікованих новин
-    CREATE_POSTED_NEWS_TABLE = """
-        CREATE TABLE IF NOT EXISTS posted_news (
-            news_link TEXT PRIMARY KEY,
-            posted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-        );
-    """
-    
-    # Таблиця користувачів (для реферальної системи)
-    CREATE_USERS_TABLE = """
-        CREATE TABLE IF NOT EXISTS users (
-            user_id BIGINT PRIMARY KEY,
-            username TEXT,
-            referred_by BIGINT NULL,
-            referral_count INTEGER DEFAULT 0,
-            created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-        );
-    """
-    
-    # Запит на отримання наступної пріоритетної новини
-    SELECT_NEXT_NEWS = f"""
-        SELECT n.title, n.link, n.source, n.llm_summary, n.priority
-        FROM news n
-        WHERE n.status = 'ready'
-        ORDER BY n.priority DESC, n.published_at ASC
-        LIMIT 1;
-    """
+class GeminiClient:
+    """Клієнт для взаємодії з Gemini API для AI-завдань."""
+    MODEL_NAME = "gemini-2.5-flash-preview-05-20"
+    API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_NAME}:generateContent"
 
-# --- 4. ФУНКЦІЇ БАЗИ ДАНИХ (DB) ---
+    def __init__(self, session: ClientSession, api_key: str):
+        self.session = session
+        self.api_key = api_key
+        logger.info(f"GeminiClient ініціалізовано для моделі {self.MODEL_NAME}.")
 
-async def create_db_pool() -> asyncpg.Pool:
-    """Створення та ініціалізація пулу підключень до PostgreSQL."""
-    if not DATABASE_URL:
-        logger.critical("DATABASE_URL не встановлено!")
-        raise ValueError("DATABASE_URL є обов'язковим.")
-
-    fixed_url = DATABASE_URL.replace("postgres://", "postgresql://", 1)
-
-    pool = await asyncpg.create_pool(fixed_url)
-    async with pool.acquire() as conn:
-        # Створюємо всі необхідні таблиці
-        await conn.execute(DBSchema.CREATE_NEWS_TABLE)
-        await conn.execute(DBSchema.CREATE_POSTED_NEWS_TABLE)
-        await conn.execute(DBSchema.CREATE_USERS_TABLE) # Нова таблиця користувачів
-        logger.info("Схема БД перевірена/оновлена (включно з LLM та реферальними полями).")
-    return pool
-
-async def get_or_create_user(pool: asyncpg.Pool, user_id: int, username: Optional[str], referrer_id: Optional[int]) -> Tuple[Dict[str, Any], bool]:
-    """Отримує або створює користувача. Повертає кортеж (дані користувача, чи був створений новий)."""
-    async with pool.acquire() as conn:
-        # 1. Спроба отримати існуючого користувача
-        user_record = await conn.fetchrow("SELECT * FROM users WHERE user_id = $1", user_id)
+    async def _call_api(self, prompt: str, system_instruction: str) -> Optional[str]:
+        """Універсальний метод для виклику Gemini API."""
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "tools": [{"google_search": {}}], # Заземлення через Google Search для актуальності
+        }
         
-        if user_record:
-            return dict(user_record), False
-        
-        # 2. Якщо користувач новий, створюємо його
-        # Вставка нового користувача
-        username = username if username else f"user_{user_id}"
-        
-        new_user = await conn.fetchrow("""
-            INSERT INTO users (user_id, username, referred_by)
-            VALUES ($1, $2, $3)
-            RETURNING *
-        """, user_id, username, referrer_id)
-        
-        # 3. Якщо є реферер, збільшуємо його лічильник
-        if referrer_id and referrer_id != user_id:
-            await conn.execute("UPDATE users SET referral_count = referral_count + 1 WHERE user_id = $1", referrer_id)
-            logger.info(f"📈 Новий реферал: користувач {user_id} запрошений {referrer_id}.")
-
-        return dict(new_user), True
-
-# Функції DB для новин залишаються ідентичними попередньому рішенню
-async def save_new_news(pool: asyncpg.Pool, news_items: List[Dict[str, Any]]) -> int:
-    """Зберігання нових новин у БД зі статусом 'raw'."""
-    if not news_items: return 0
-    all_links = [item['link'] for item in news_items]
-    unique_items = []
-    
-    async with pool.acquire() as conn:
-        existing_records = await conn.fetch("SELECT link FROM news WHERE link = ANY($1::text[])", all_links)
-        existing_links = {record['link'] for record in existing_records}
-
-        for item in news_items:
-            if item['link'] not in existing_links:
-                unique_items.append(item)
-
-        if not unique_items: return 0
-
-        columns = ('title', 'link', 'source', 'published_at', 'status')
-        records = [(item['title'], item['link'], item['source'], item['published_at'], 'raw') for item in unique_items]
-        
-        await conn.copy_records_to_table('news', records=records, columns=columns)
-        count = len(records)
-        logger.info(f"💾 Збережено {count} нових новин зі статусом 'raw'.")
-        return count
-
-async def get_next_news_for_posting(pool: asyncpg.Pool) -> Optional[Dict[str, Any]]:
-    """Отримання наступної найпріоритетнішої новини."""
-    async with pool.acquire() as conn:
-        record = await conn.fetchrow(DBSchema.SELECT_NEXT_NEWS)
-        return dict(record) if record else None
-
-async def mark_news_as_posted(pool: asyncpg.Pool, news_link: str):
-    """Позначення новини як опублікованої."""
-    async with pool.acquire() as conn:
-        await conn.execute("INSERT INTO posted_news (news_link) VALUES ($1) ON CONFLICT (news_link) DO NOTHING", news_link)
-        await conn.execute("UPDATE news SET status = 'posted' WHERE link = $1", news_link)
-        
-async def get_raw_news_batch(pool: asyncpg.Pool) -> List[Dict[str, Any]]:
-    """Отримання партії 'raw' новин для LLM обробки."""
-    async with pool.acquire() as conn:
-        raw_news = await conn.fetch(f"SELECT id, title FROM news WHERE status = 'raw' LIMIT {LLM_PROCESSING_BATCH_SIZE}")
-        return [dict(row) for row in raw_news]
-
-async def update_news_llm_result(pool: asyncpg.Pool, news_id: int, summary: str, priority: int, status: str):
-    """Оновлення новини результатами LLM."""
-    async with pool.acquire() as conn:
-        await conn.execute("""
-            UPDATE news
-            SET llm_summary = $1, priority = $2, status = $3
-            WHERE id = $4
-        """, summary, priority, status, news_id)
-
-
-# --- 5. ФУНКЦІЇ LLM API ---
-
-LLM_RESPONSE_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "summary_ukr": {"type": "STRING", "description": "Коротке, привабливе резюме новини до 50 слів українською."},
-        "priority_score": {"type": "INTEGER", "description": f"Оцінка важливості/популярності новини від 1 до {MAX_GEMINI_PRIORITY}. {MAX_GEMINI_PRIORITY} - найважливіша/найпопулярніша."}
-    },
-    "required": ["summary_ukr", "priority_score"],
-    "propertyOrdering": ["summary_ukr", "priority_score"]
-}
-
-LLM_SYSTEM_PROMPT = (
-    "Ви професійний український редактор новин для Telegram-каналу. Ваша мета — оцінити важливість заголовка та "
-    "скласти коротке, 'клікабельне' резюме. Оцінюйте важливість за шкалою 1 (локальна, малоцікава) до 5 (національна, світова, "
-    "найпопулярніша, MUST READ). Резюме має бути до 50 слів, динамічним та нейтральним."
-)
-
-async def generate_content_with_gemini(session: ClientSession, prompt: str) -> Optional[Dict[str, Any]]:
-    """Виконання POST-запиту до Gemini API з експоненціальним відступом."""
-    if not GEMINI_API_KEY:
-        return None
-        
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "systemInstruction": {"parts": [{"text": LLM_SYSTEM_PROMPT}]},
-        "generationConfig": {
-            "responseMimeType": "application/json",
-            "responseSchema": LLM_RESPONSE_SCHEMA
-        },
-    }
-
-    max_retries = 3
-    delay = 1.0
-    for attempt in range(max_retries):
-        try:
-            async with session.post(url, json=payload, timeout=20) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    
-                    if result and result.get('candidates'):
-                        json_text = result['candidates'][0]['content']['parts'][0].get('text')
-                        if json_text:
-                            parsed_json = json.loads(json_text)
-                            if 'summary_ukr' in parsed_json and 'priority_score' in parsed_json:
-                                return parsed_json
-                    
-                    logger.error(f"LLM повернув невалідну відповідь або порожній JSON. Статус: {response.status}")
-                    return None
+        # Обробка та ретраї з експоненційним відступом
+        for attempt in range(5):
+            try:
+                # Додаємо API-ключ у запит.
+                url = f"{self.API_URL}?key={self.api_key}"
                 
-                if response.status in (429, 500, 503) and attempt < max_retries - 1:
-                    await asyncio.sleep(delay)
-                    delay *= 2.5 
-                else:
-                    logger.error(f"Критична помилка LLM API: {response.status}")
-                    return None
+                async with self.session.post(url, json=payload, timeout=20) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text')
+                        if text:
+                            return text.strip()
+                        return None
                     
-        except asyncio.TimeoutError:
-            await asyncio.sleep(delay)
-            delay *= 2.5
-        except Exception as e:
-            logger.error(f"Непередбачена помилка LLM API: {e}", exc_info=True)
-            return None
-            
-    return None
+                    logger.warning(f"Gemini API Error: Status {response.status}, Attempt {attempt+1}")
+                    if response.status == 429 or response.status >= 500:
+                        await asyncio.sleep(2 ** attempt) # Експоненційний відступ
+                        continue
+                    break # Вихід при інших помилках
+            except asyncio.TimeoutError:
+                logger.error(f"Gemini API Timeout on attempt {attempt+1}")
+                if attempt < 4:
+                    await asyncio.sleep(2 ** attempt)
+                continue
+            except Exception as e:
+                logger.error(f"Error calling Gemini API: {e}")
+                break
+        return None
 
-# --- 6. ОСНОВНІ БІЗНЕС-ПРОЦЕСИ ---
-
-async def collect_news(pool: asyncpg.Pool, session: ClientSession):
-    """Асинхронний збір новин з усіх RSS-фідів."""
-    start_time = datetime.now()
-    fetch_tasks = [
-        fetch_and_parse_rss(session, url, name)
-        for name, url in RSS_FEEDS.items()
-    ]
-    results = await asyncio.gather(*fetch_tasks)
-    
-    all_news_items = [item for news_list in results for item in news_list]
-    duration = (datetime.now() - start_time).total_seconds()
-    logger.info(f"📰 Знайдено {len(all_news_items)} новин за {duration:.2f} сек.")
-
-    await save_new_news(pool, all_news_items)
-
-async def process_news_with_llm(pool: asyncpg.Pool, session: ClientSession):
-    """Фонове завдання: обробка необроблених новин через LLM для ранжування та резюмування."""
-    logger.info("--- 🧠 Запуск LLM-обробки новин ---")
-    
-    raw_news = await get_raw_news_batch(pool)
-
-    if not raw_news:
-        logger.info("--- 📭 Немає 'raw' новин для LLM-обробки. ---")
-        return
-
-    llm_tasks = []
-    for news_item in raw_news:
-        prompt = f"Заголовок новини: {news_item['title']}. Склади резюме та оціни пріоритет."
-        llm_tasks.append(generate_content_with_gemini(session, prompt))
-
-    results = await asyncio.gather(*llm_tasks)
-    successful_updates = 0
-    
-    for item, llm_result in zip(raw_news, results):
-        news_id = item['id']
+    async def analyze_news_content(self, title: str, summary: str) -> Tuple[Optional[str], Optional[str]]:
+        """Генерує підсумок + залучаючий запит."""
+        news_text = f"Заголовок: {title}\nКороткий опис: {summary}"
         
-        if llm_result:
-            summary = llm_result.get('summary_ukr', "Невдале резюме.")
-            # Гарантуємо, що пріоритет знаходиться в діапазоні [1, MAX_GEMINI_PRIORITY]
-            priority = max(1, min(MAX_GEMINI_PRIORITY, llm_result.get('priority_score', 1)))
-            status = 'ready'
-            successful_updates += 1
-        else:
-            summary = f"**Помилка LLM обробки.** Оригінальний заголовок: {item['title']}"
-            priority = 1
-            status = 'llm_failed'
-
-        await update_news_llm_result(pool, news_id, summary, priority, status)
-
-    logger.info(f"--- ✅ LLM-обробка завершена. Успішно оновлено {successful_updates}/{len(raw_news)} записів. ---")
-
-
-async def post_news_to_channel(pool: asyncpg.Pool, bot: Bot):
-    """Публікація наступної найпріоритетнішої новини."""
-    logger.info("--- ▶️ Запуск циклу постингу ---")
-    news_item = await get_next_news_for_posting(pool)
-
-    if not news_item:
-        logger.info("--- 📭 Немає новин зі статусом 'ready' для публікації. ---")
-        return
-
-    message_text = format_news_message(news_item)
-    
-    try:
-        await bot.send_message(
-            chat_id=NEWS_CHANNEL_ID,
-            text=message_text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True 
+        # 1. Запит на підсумок та залучення (Engagement)
+        system_instruction_summary = (
+            "Ти професійний контент-менеджер та аналітик. "
+            "Твоє завдання - взяти наданий текст новини, стисло його підсумувати (2-3 речення), "
+            "а потім створити привабливе, дискусійне запитання або заклик до дії, "
+            "щоб максимально залучити аудиторію в Telegram-каналі. "
+            "Відповідь має бути лише українською мовою та у форматі: "
+            "[Стисле_підсумування]\\n\\n[Питання_для_залучення_аудиторії]"
         )
+        engagement_text = await self._call_api(news_text, system_instruction_summary)
         
-        await mark_news_as_posted(pool, news_item['link'])
-        logger.info(f"--- ✅ Опубліковано 1 новину (Пріоритет: {news_item.get('priority', 'N/A')}). ---")
+        # 2. Запит на хештеги
+        system_instruction_hashtags = (
+            "Ти експерт з трендингу. Згенеруй 5 найбільш релевантних та популярних хештегів "
+            "для наданої новини. Відповідь має бути лише у вигляді списку хештегів, "
+            "розділених пробілами, без жодного іншого тексту, наприклад: #Україна #Політика #Війна #Новини #Світ."
+        )
+        hashtags = await self._call_api(news_text, system_instruction_hashtags)
         
-    except Exception as e:
-        logger.error(f"Помилка публікації новини {news_item['link']}: {e}", exc_info=True)
+        return engagement_text, hashtags
 
+# --- 3. ФУНКЦІЇ ВЗАЄМОДІЇ З БАЗОЮ ДАНИХ (asyncpg) ---
 
-# --- 7. ДОПОМІЖНІ ФУНКЦІЇ ---
+async def init_db(pool: asyncpg.Pool):
+    """Створення таблиць, якщо вони не існують."""
+    await pool.execute('''
+        CREATE TABLE IF NOT EXISTS subscribers (
+            user_id BIGINT PRIMARY KEY,
+            subscribed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+    ''')
+    await pool.execute('''
+        CREATE TABLE IF NOT EXISTS published_news (
+            guid TEXT PRIMARY KEY,
+            published_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        );
+    ''')
+    logger.info("Таблиці 'subscribers' та 'published_news' перевірено/створено.")
 
-async def fetch_and_parse_rss(session: ClientSession, feed_url: str, source_name: str) -> List[Dict[str, Any]]:
-    """Асинхронне отримання та парсинг RSS-фіда."""
+async def is_news_published(pool: asyncpg.Pool, guid: str) -> bool:
+    """Перевіряє, чи була новина вже опублікована (за GUID)."""
+    return await pool.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM published_news WHERE guid = $1)", 
+        guid
+    )
+
+async def mark_news_as_published(pool: asyncpg.Pool, guid: str):
+    """Позначає новину як опубліковану."""
+    await pool.execute(
+        "INSERT INTO published_news (guid) VALUES ($1) ON CONFLICT (guid) DO NOTHING", 
+        guid
+    )
+
+async def get_subscribers(pool: asyncpg.Pool) -> List[int]:
+    """Отримує список ID всіх підписників."""
+    records = await pool.fetch("SELECT user_id FROM subscribers")
+    return [r['user_id'] for r in records]
+
+async def subscribe_user(pool: asyncpg.Pool, user_id: int) -> bool:
+    """Додає користувача до підписників."""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (compatible; MyNewsBot/1.0)'}
-        async with session.get(feed_url, timeout=15, headers=headers, ssl=False) as response:
-            if response.status in (404, 403, 401):
-                logger.warning(f"⚠️ HTTP Помилка {response.status} для {source_name}")
+        await pool.execute(
+            "INSERT INTO subscribers (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            user_id
+        )
+        return True
+    except Exception as e:
+        logger.error(f"Помилка підписки користувача {user_id}: {e}")
+        return False
+
+async def unsubscribe_user(pool: asyncpg.Pool, user_id: int) -> bool:
+    """Видаляє користувача з підписників."""
+    try:
+        result = await pool.execute("DELETE FROM subscribers WHERE user_id = $1", user_id)
+        return result == 'DELETE 1'
+    except Exception as e:
+        logger.error(f"Помилка відписки користувача {user_id}: {e}")
+        return False
+
+# --- 4. ОСНОВНА ЛОГІКА ТА ШЕДУЛЕР ---
+
+class NewsItem:
+    """Об'єкт для зберігання даних про новину."""
+    def __init__(self, title: str, summary: str, link: str, guid: str, published: datetime):
+        self.title = title
+        self.summary = summary
+        self.link = link
+        self.guid = guid
+        self.published = published
+
+async def fetch_and_parse_news(session: ClientSession) -> List[NewsItem]:
+    """Асинхронно завантажує та парсить RSS-стрічку."""
+    try:
+        async with session.get(NEWS_RSS_URL, timeout=10) as response:
+            if response.status != 200:
+                logger.error(f"Помилка завантаження RSS: {response.status}")
                 return []
             
             content = await response.text()
-            news_feed = await asyncio.to_thread(feedparser.parse, content)
-
-            parsed_list = []
-            for entry in news_feed.entries:
+            feed = feedparser.parse(content)
+            
+            news_list: List[NewsItem] = []
+            
+            for entry in feed.entries:
                 try:
-                    title = getattr(entry, 'title', 'Без заголовка').strip()
-                    link = getattr(entry, 'link', None)
-                    published_time = getattr(entry, 'published_parsed', None)
-                    if not link or not title or not published_time: continue
-
-                    published_dt = datetime(*published_time[:6], tzinfo=timezone.utc).astimezone(KYIV_TZ)
+                    # Використання BeautifulSoup для очищення summary
+                    soup = BeautifulSoup(entry.summary, 'html.parser')
+                    clean_summary = soup.get_text().strip()
                     
-                    parsed_list.append({
-                        'title': title,
-                        'link': link,
-                        'source': source_name,
-                        'published_at': published_dt,
-                    })
+                    # Визначення часу публікації (з використанням utc_to_dt та переведенням до Kyiv Timezone)
+                    published_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).astimezone(KYIV_TZ)
+                    
+                    # Використання link або guid як унікального ідентифікатора (GUID)
+                    guid = entry.link or entry.id
+                    
+                    news_list.append(NewsItem(
+                        title=entry.title,
+                        summary=clean_summary,
+                        link=entry.link,
+                        guid=guid,
+                        published=published_dt
+                    ))
                 except Exception as e:
-                    logger.warning(f"Помилка обробки запису з {source_name}: {e}")
-            return parsed_list
+                    logger.warning(f"Пропуск новинного елемента через помилку парсингу: {e}")
+            
+            # Сортування новин за часом публікації (найновіші перші)
+            return sorted(news_list, key=lambda x: x.published, reverse=True)
+            
     except Exception as e:
-        logger.error(f"Непередбачена помилка при завантаженні RSS {feed_url}: {e}", exc_info=True)
-    return []
+        logger.error(f"Критична помилка при завантаженні/парсингу RSS: {e}")
+        return []
 
-def format_news_message(news: Dict[str, Any]) -> str:
-    """Форматування повідомлення для публікації, використовуючи LLM-резюме."""
-    summary = news.get('llm_summary', 'Не вдалося отримати резюме.')
-    priority = news.get('priority', 0)
+async def process_and_publish_news(bot: Bot, pool: asyncpg.Pool, session: ClientSession):
+    """Основна функція для планувальника: завантаження, AI-обробка та розсилка."""
     
-    emoji = "🔥" if priority >= 4 else "📰" if priority >= 2 else "🗞️"
-
-    message = (
-        f"{emoji} <b>[ТОП Новина - Пріоритет {priority}/{MAX_GEMINI_PRIORITY}]</b>\n\n"
-        f"<b>{summary}</b>\n\n"
-        f"➡️ Оригінал: <i>{news['source']}</i>\n"
-        f"🔗 <a href='{news['link']}'>Читати повністю</a>\n\n"
-        f"<i>#Новини #Україна #LLM</i>"
-    )
-    return message
-
-
-# --- 8. ХЕНДЛЕРИ КОМАНД ТА РЕФЕРАЛЬНА СИСТЕМА ---
-
-@CommandStart()
-async def handle_start(message: types.Message, bot: Bot, pool: asyncpg.Pool):
-    """
-    Хендлер команди /start.
-    Обробляє також deep-linking для реферальної системи: /start <referrer_id>
-    """
-    user_id = message.from_user.id
-    username = message.from_user.username
-    referrer_id = None
+    logger.info("Запуск планувальника новин...")
     
-    # Перевірка на deep link (параметр start)
-    if message.text and len(message.text.split()) > 1:
-        try:
-            # Отримання параметру з глибокого посилання
-            payload = message.text.split()[1]
-            if payload.isdigit():
-                referrer_id = int(payload)
-            else:
-                # Це може бути будь-який рядок, який ми вирішимо використовувати як реф. код
-                logger.warning(f"Неправильний формат реферального payload: {payload}")
-                
-        except (ValueError, IndexError):
-            pass
-
-    # 1. Реєстрація або отримання користувача
-    user_data, is_new_user = await get_or_create_user(pool, user_id, username, referrer_id)
-    
-    response_text = f"Вітаю, <b>@{username or user_id}</b>! Я ваш професійний бот новин 📰. \n"
-    
-    if is_new_user:
-        if referrer_id and referrer_id != user_id:
-            response_text += f"🎉 Ви приєдналися за запрошенням користувача <b>{referrer_id}</b>! Дякуємо за підтримку.\n\n"
-        else:
-            response_text += "🔔 Дякуємо, що приєдналися до нас! \n\n"
-    
-    response_text += "Я автоматично збираю новини, ранжую їх за важливістю (за допомогою LLM) та публікую в канал. "
-    response_text += "Щоб допомогти нам рости, скористайтеся командою /referral."
-
-    await message.answer(response_text, parse_mode=ParseMode.HTML)
-
-
-@Command("referral")
-async def handle_referral(message: types.Message, bot: Bot, pool: asyncpg.Pool):
-    """Команда для отримання реферального посилання та статистики."""
-    user_id = message.from_user.id
-    
-    async with pool.acquire() as conn:
-        user_record = await conn.fetchrow("SELECT referral_count FROM users WHERE user_id = $1", user_id)
-        
-    if not user_record:
-        # Якщо користувач чомусь не в БД, створюємо його (хоча цього не повинно статися після /start)
-        await get_or_create_user(pool, user_id, message.from_user.username, None)
-        user_record = await conn.fetchrow("SELECT referral_count FROM users WHERE user_id = $1", user_id)
-        
-    referral_count = user_record['referral_count'] if user_record else 0
-    
-    # Створення унікального посилання deep link
-    link = await create_start_link(bot, str(user_id), encode=True)
-    
-    referral_message = (
-        "📈 <b>Запрошуйте друзів та розвивайте спільноту!</b>\n\n"
-        "Ваше унікальне посилання для запрошення:\n"
-        f"<code>{link}</code>\n\n"
-        f"Кількість запрошених користувачів: <b>{referral_count}</b>\n\n"
-        "Кожен запрошений друг допомагає нам покращувати якість контенту!"
-    )
-    
-    await message.answer(referral_message, parse_mode=ParseMode.HTML)
-
-
-@Command("help")
-async def handle_help(message: types.Message):
-    """Хендлер команди /help."""
-    await message.answer(
-        "Я працюю автономно, обираючи найважливіші новини.\n\n"
-        "<b>Команди:</b>\n"
-        "/start - Почати спілкування\n"
-        "/referral - Отримати посилання для запрошення та переглянути статистику\n"
-        "/help - Показати цю довідку\n\n"
-        "Новини збираються, ранжуються (LLM) та публікуються за пріоритетом.",
-        parse_mode=ParseMode.HTML
-    )
-
-# --- 9. ПЛАНУВАЛЬНИК ТА ЗАПУСК ---
-
-async def scheduler_loop(pool: asyncpg.Pool, session: ClientSession, bot: Bot):
-    """Головний цикл планувальника: керує збором, обробкою та постингом."""
-    
-    # Виконуємо перший збір та обробку одразу
-    await collect_news(pool, session)
-    await process_news_with_llm(pool, session)
-    await post_news_to_channel(pool, bot)
-
-    while True:
-        # Постинг найпріоритетніших новин
-        await asyncio.sleep(POST_INTERVAL_MINUTES * 60)
-        await post_news_to_channel(pool, bot)
-
-        current_minute = datetime.now(KYIV_TZ).minute
-        
-        # Збір новин
-        if (current_minute % COLLECTION_INTERVAL_MINUTES) < POST_INTERVAL_MINUTES:
-             await collect_news(pool, session)
-        
-        # Обробка LLM
-        if (current_minute % LLM_PROCESSING_INTERVAL_MINUTES) < POST_INTERVAL_MINUTES:
-             await process_news_with_llm(pool, session)
-
-
-async def on_startup(app: web.Application):
-    """Запуск фонових завдань та встановлення вебхука при старті сервера."""
-    pool: asyncpg.Pool = app["pool"]
-    session: ClientSession = app["session"]
-    bot: Bot = app["bot"]
-    
-    await bot.set_webhook(WEBHOOK_URL, allowed_updates=app["dp"].resolve_used_update_types())
-    logger.info(f"Вебхук встановлено на: {WEBHOOK_URL}")
-
-    # Запуск основного циклу планувальника
-    app["scheduler"] = asyncio.create_task(scheduler_loop(pool, session, bot))
-    logger.info("Фонові завдання збору/обробки/постингу запущені.")
-
-async def on_shutdown(app: web.Application):
-    """Зупинка завдань та закриття ресурсів при вимкненні."""
-    app["scheduler"].cancel()
-    try:
-        await app["scheduler"]
-    except asyncio.CancelledError:
-        logger.info("Фонові завдання зупинено.")
-
-    await app["session"].close()
-    await app["pool"].close()
-    await app["bot"].session.close()
-    logger.info("З'єднання aiohttp та БД закрито.")
-
-# --- 10. ФУНКЦІЇ ЗАПУСКУ ---
-
-async def handle_webhook(request: web.Request):
-    """Хендлер вхідних вебхуків."""
-    if request.match_info.get('token') != BOT_TOKEN:
-        return web.Response(status=403, text="Invalid token")
-
-    bot: Bot = request.app['bot']
-    dispatcher: Dispatcher = request.app['dp']
-
-    try:
-        data = await request.json()
-        telegram_update = types.Update.model_validate(data, context={"bot": bot})
-        await dispatcher.feed_update(bot, telegram_update)
-        return web.Response(status=200)
-    except Exception as e:
-        logger.error(f"Помилка обробки Webhook: {e}", exc_info=True)
-        return web.Response(status=500)
-
-async def main():
-    """Головна функція запуску Webhook сервера."""
-    if not BOT_TOKEN or not DATABASE_URL or not WEBHOOK_HOST:
-        logger.critical("Критична помилка: Необхідні змінні оточення (BOT_TOKEN, DATABASE_URL, WEBHOOK_HOST) не встановлено.")
-        # Запуск у режимі Polling для локальної розробки (якщо не встановлено WEBHOOK_HOST)
-        if WEBHOOK_HOST is None:
-             logger.warning("WEBHOOK_HOST не встановлено. Запуск у режимі Polling (для розробки).")
-        
-        if WEBHOOK_HOST is not None:
-             return
-
-    default_props = DefaultBotProperties(parse_mode=ParseMode.HTML)
-    bot = Bot(token=BOT_TOKEN, default=default_props)
-    dp = Dispatcher()
-    
-    # Реєстрація хендлерів
-    dp.message.register(handle_start, CommandStart())
-    dp.message.register(handle_referral, Command("referral"))
-    dp.message.register(handle_help, Command("help"))
-
-    try:
-        pool = await create_db_pool()
-        session = ClientSession(timeout=aiohttp.ClientTimeout(total=60))
-    except Exception as e:
-        logger.critical(f"Критична помилка ініціалізації ресурсів (DB/Session): {e}")
-        await bot.session.close()
+    # 1. Отримати список новин
+    all_news = await fetch_and_parse_news(session)
+    if not all_news:
+        logger.info("Нових новин не знайдено або помилка завантаження.")
         return
 
-    # Middleware для передачі ресурсів у хендлери
-    # Це забезпечує доступ до `pool` та `session` у будь-якій команді/хендлері
-    dp["pool"] = pool
-    dp["session"] = session
+    # 2. Фільтрування вже опублікованих новин
+    news_to_process = []
+    for item in all_news:
+        if not await is_news_published(pool, item.guid):
+            news_to_process.append(item)
+            
+    if not news_to_process:
+        logger.info("Усі останні новини вже опубліковані.")
+        return
+
+    # Обмеження кількості новин для обробки, щоб не перевантажувати API
+    news_to_publish = news_to_process[:MAX_NEWS_TO_PROCESS]
     
-    if WEBHOOK_HOST:
-        # --- РЕЖИМ WEBHOOK (ПРОДАКШЕН) ---
-        app = web.Application()
-        app["bot"] = bot
-        app["dp"] = dp
-        app["pool"] = pool
-        app["session"] = session
+    logger.info(f"Знайдено {len(news_to_publish)} нових новин для обробки AI.")
+    
+    gemini_client = GeminiClient(session, GEMINI_API_KEY)
+    subscribers = await get_subscribers(pool)
+    
+    if not subscribers:
+        logger.warning("Немає активних підписників. Новини не будуть розіслані.")
+        # Все одно позначаємо як опубліковані, щоб не було дублів при появі першого підписника
+        for item in news_to_publish:
+            await mark_news_as_published(pool, item.guid)
+        return
 
-        app.router.add_post(f"/webhook/{{token}}", handle_webhook)
-        app.on_startup.append(on_startup)
-        app.on_shutdown.append(on_shutdown)
+    # 3. AI-обробка та розсилка
+    for item in news_to_publish:
+        logger.info(f"Обробка AI: {item.title}")
         
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
-        await site.start()
+        # AI-генерування
+        engagement_text, hashtags = await gemini_client.analyze_news_content(item.title, item.summary)
+        
+        if not engagement_text:
+            logger.error(f"AI не змогло обробити новину: {item.title}. Пропуск розсилки.")
+            continue # Пропускаємо цю новину
+            
+        # Формування фінального тексту повідомлення
+        
+        # Розбиття на підсумок та залучення
+        try:
+            summary, engagement_question = engagement_text.split('\n\n', 1)
+        except ValueError:
+            # На випадок, якщо AI не дотрималося формату
+            summary = engagement_text
+            engagement_question = ""
+        
+        # Хештеги
+        hashtag_line = f"\n\n**Хештеги:** {hashtags}" if hashtags else ""
 
-        await asyncio.Event().wait()
-
-    else:
-        # --- РЕЖИМ POLLING (РОЗРОБКА) ---
-        await asyncio.gather(
-            scheduler_loop(pool, session, bot),
-            dp.start_polling(bot)
+        message_text = (
+            f"**📰 TOP НОВИНА:** {item.title}\n\n"
+            f"{summary}\n\n"
+            f"**🌐 Джерело:** [Читати повністю]({item.link})\n\n"
+            f"**❓ Залучення:** *{engagement_question.strip()}*\n"
+            f"{hashtag_line}"
         )
+
+        # 4. Розсилка підписникам
+        logger.info(f"Розсилка новини '{item.title}' {len(subscribers)} підписникам.")
         
-if __name__ == "__main__":
+        for user_id in subscribers:
+            try:
+                await bot.send_message(
+                    chat_id=user_id,
+                    text=message_text,
+                    parse_mode=ParseMode.MARKDOWN
+                )
+            except Exception as e:
+                logger.warning(f"Не вдалося надіслати повідомлення користувачу {user_id}: {e}")
+        
+        # 5. Позначити як опубліковану
+        await mark_news_as_published(pool, item.guid)
+
+async def news_scheduler(bot: Bot, pool: asyncpg.Pool, session: ClientSession):
+    """Нескінченний цикл для періодичної перевірки новин."""
+    while True:
+        try:
+            await process_and_publish_news(bot, pool, session)
+        except Exception as e:
+            logger.error(f"Помилка в циклі планувальника новин: {e}")
+        
+        await asyncio.sleep(NEWS_INTERVAL_SECONDS)
+
+
+# --- 5. AIOGRAM ХЕНДЛЕРИ (РОУТЕРИ) ---
+
+router = Router()
+
+@router.message(CommandStart())
+async def handle_start(message: types.Message, pool: asyncpg.Pool, bot: Bot):
+    """Обробник команди /start. Вітає та пропонує підписку."""
+    user_id = message.from_user.id
+    
+    # Спроба підписати автоматично
+    await subscribe_user(pool, user_id)
+    
+    response = (
+        f"👋 **Вітаю, {message.from_user.full_name}!**\n\n"
+        "Я — ваш *AI News Aggregator Bot*. Моя місія — знаходити найактуальніші та найпопулярніші "
+        "новини з українських джерел, обробляти їх через **Gemini AI** для **стислого підсумку**, "
+        "додавати **трендові хештеги** та **залучаючі питання** для дискусії.\n\n"
+        "**✅ Ви автоматично підписані!**\n\n"
+        "**Команди:**\n"
+        "/subscribe - Підписатися на щогодинні AI-новини.\n"
+        "/unsubscribe - Відписатися від розсилки.\n"
+        "/status - Перевірити статус підписки."
+    )
+    await message.answer(response, parse_mode=ParseMode.MARKDOWN)
+
+@router.message(Command("subscribe"))
+async def handle_subscribe(message: types.Message, pool: asyncpg.Pool):
+    """Обробник команди /subscribe."""
+    user_id = message.from_user.id
+    if await subscribe_user(pool, user_id):
+        await message.answer("✅ **Ви успішно підписалися!** Очікуйте найактуальніших новин, оброблених AI.", 
+                             parse_mode=ParseMode.MARKDOWN)
+    else:
+        await message.answer("ℹ️ Ви вже підписані на розсилку.", 
+                             parse_mode=ParseMode.MARKDOWN)
+
+@router.message(Command("unsubscribe"))
+async def handle_unsubscribe(message: types.Message, pool: asyncpg.Pool):
+    """Обробник команди /unsubscribe."""
+    user_id = message.from_user.id
+    if await unsubscribe_user(pool, user_id):
+        await message.answer("❌ **Ви успішно відписалися.** Ви більше не отримуватимете AI-новини.", 
+                             parse_mode=ParseMode.MARKDOWN)
+    else:
+        await message.answer("ℹ️ Ви не були підписані.", 
+                             parse_mode=ParseMode.MARKDOWN)
+
+@router.message(Command("status"))
+async def handle_status(message: types.Message, pool: asyncpg.Pool):
+    """Перевіряє статус підписки користувача."""
+    user_id = message.from_user.id
+    is_subscribed = await pool.fetchval("SELECT EXISTS(SELECT 1 FROM subscribers WHERE user_id = $1)", user_id)
+    
+    if is_subscribed:
+        response = "✅ **Ваш статус:** Ви підписані на розсилку AI-новин."
+    else:
+        response = "❌ **Ваш статус:** Ви не підписані. Скористайтеся /subscribe, щоб отримувати новини."
+        
+    await message.answer(response, parse_mode=ParseMode.MARKDOWN)
+
+@router.message(F.text)
+async def handle_general_text(message: types.Message):
+    """Обробник будь-якого іншого тексту."""
+    response = (
+        "🤖 Я бот-агрегатор новин. Моя основна функція — розсилка AI-оброблених новин.\n"
+        "Скористайтеся командами:\n"
+        "/subscribe\n"
+        "/unsubscribe\n"
+        "/status"
+    )
+    await message.answer(response)
+
+# --- 6. WEBHOOK ТА ЗАПУСК ДОДАТКУ ---
+
+async def handle_webhook(request: web.Request):
+    """Обробник вхідних POST-запитів від Telegram (webhook)."""
+    bot: Bot = request.app["bot"]
+    dp: Dispatcher = request.app["dp"]
+    
+    # Telegram надсилає оновлення як JSON
+    update = types.Update.model_validate(await request.json())
+    
+    # Обробка оновлення диспетчером
+    await dp.feed_update(bot, update)
+    
+    # Обов'язкова відповідь 200 OK
+    return web.Response()
+
+async def on_startup(app: web.Application):
+    """Виконується при запуску Aiohttp сервера."""
+    bot: Bot = app["bot"]
+    pool: asyncpg.Pool = app["pool"]
+    session: ClientSession = app["session"]
+
+    logger.info("Запуск on_startup...")
+    
+    # 1. Ініціалізація бази даних
+    await init_db(pool)
+    
+    # 2. Встановлення Webhook
+    logger.info(f"Встановлення Webhook на URL: {WEBHOOK_URL}")
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+
+    # 3. Запуск фонового планувальника новин
+    # Створюємо завдання, яке буде виконуватися у фоні
+    app["news_task"] = asyncio.create_task(news_scheduler(bot, pool, session))
+    logger.info("Фоновий планувальник новин запущено.")
+
+async def on_shutdown(app: web.Application):
+    """Виконується при зупинці Aiohttp сервера."""
+    bot: Bot = app["bot"]
+    session: ClientSession = app["session"]
+    pool: asyncpg.Pool = app["pool"]
+
+    logger.info("Запуск on_shutdown...")
+    
+    # 1. Відміна Webhook
+    logger.info("Видалення Webhook...")
+    await bot.delete_webhook()
+
+    # 2. Зупинка фонового завдання
+    app["news_task"].cancel()
+    logger.info("Фонове завдання планувальника новин скасовано.")
+
+    # 3. Закриття HTTP-сесії
+    await session.close()
+    
+    # 4. Закриття підключення до БД
+    await pool.close()
+    logger.info("Підключення до БД закрито.")
+
+async def main():
+    """Основна функція запуску програми."""
+    
+    # Ініціалізація Bot, Dispatcher
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.include_router(router) # Додавання роутера
+
+    # Створення пулу підключень до PostgreSQL
+    try:
+        # asyncpg вимагає, щоб query-параметри були передані окремо від URL, 
+        # особливо якщо URL з Render містить SSL-параметри
+        pool = await asyncpg.create_pool(DATABASE_URL)
+    except Exception as e:
+        logger.critical(f"Не вдалося підключитися до бази даних: {e}")
+        return
+
+    # Створення Aiohttp сесії
+    session = ClientSession()
+
+    # 2. Налаштування aiohttp Web
+    app = web.Application()
+    
+    # 3. Зберігання ресурсів у додатку
+    app["bot"] = bot
+    app["dp"] = dp
+    app["pool"] = pool
+    app["session"] = session
+
+    # 4. Реєстрація залежностей для хендлерів DP
+    # Це гарантує, що pool і session доступні у функціях-обробниках
+    router.message.middleware.inject({'pool': pool, 'session': session, 'bot': bot})
+    router.callback_query.middleware.inject({'pool': pool, 'session': session, 'bot': bot})
+    
+    # 5. Реєстрація маршруту для вебхука
+    app.router.add_post(WEBHOOK_PATH, handle_webhook)
+    
+    # 6. Реєстрація функцій запуску/вимкнення
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
+    
+    # 7. Запуск сервера
+    logger.info(f"Запуск Webhook сервера на {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
+    
+    await site.start()
+
+    # Нескінченний цикл для підтримки роботи сервера (поки не буде скасовано)
+    # Це важливо для коректної роботи aiohttp web runner в асинхронному контексті
+    await asyncio.Event().wait() 
+
+if __name__ == '__main__':
+    # Використання asyncio.run() для запуску головної асинхронної функції
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by KeyboardInterrupt.")
+        logger.info("Бот зупинено користувачем.")
     except Exception as e:
-        logger.critical(f"Фатальна помилка виконання: {e}", exc_info=True)
+        logger.critical(f"Загальна помилка виконання: {e}")
