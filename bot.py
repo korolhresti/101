@@ -11,11 +11,11 @@ from typing import List, Optional
 import asyncpg
 import aiohttp
 from aiohttp import ClientSession, web
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, Router, types
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.client.default import DefaultBotProperties
-from aiogram.types import WebhookInfo
+from aiogram.types import WebhookInfo, InlineKeyboardMarkup, InlineKeyboardButton # <-- ДОДАНО: Кнопки
 
 # --- 1. НАЛАШТУВАННЯ СЕРЕДОВИЩА ТА ЛОГУВАННЯ ---
 
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0")) # ID адміністратора для команди /stats
 
 # Webhook конфігурація
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST") # !!! КРИТИЧНО: Ваш публічний домен (обов'язково HTTPS)
@@ -44,39 +45,134 @@ else:
      WEBHOOK_PATH = "/webhook/placeholder"
      WEBHOOK_URL = ""
 
+# Константи для preferred стилів
+EXPERT_POLITICAL = "portnikov"
+EXPERT_ECONOMIC = "libsits"
+EXPERT_MIXED = "mixed"
+
 
 # --- 2. СТРУКТУРА БАЗИ ДАНИХ ---
 
 async def create_db_tables(pool: asyncpg.Pool):
-    """Створює необхідні таблиці в базі даних."""
+    """Створює необхідні таблиці в базі даних. Додано expert_preference."""
     await pool.execute("""
         CREATE TABLE IF NOT EXISTS subscribers (
             chat_id BIGINT PRIMARY KEY,
-            subscribed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            subscribed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            expert_preference TEXT DEFAULT 'mixed' NOT NULL  -- НОВЕ ПОЛЕ для preferred
         );
     """)
 
-# --- 3. ХЕНДЛЕРИ БОТА ---
+# --- 3. ХЕНДЛЕРИ БОТА ТА ІНТЕРАКТИВНІСТЬ ---
 
-# Створюємо Router для реєстрації команд
-router = Dispatcher().router 
+router = Router() 
+
+def get_preference_keyboard() -> InlineKeyboardMarkup:
+    """Створює інлайн-клавіатуру для вибору preferred стилю новин."""
+    buttons = [
+        [
+            InlineKeyboardButton(text="Політика (Портников)", callback_data=f"set_expert_{EXPERT_POLITICAL}"),
+        ],
+        [
+            InlineKeyboardButton(text="Економіка (Лібсіц)", callback_data=f"set_expert_{EXPERT_ECONOMIC}"),
+        ],
+        [
+            InlineKeyboardButton(text="Змішаний (Рандом)", callback_data=f"set_expert_{EXPERT_MIXED}"),
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 
 @router.message(Command("start"))
 async def command_start_handler(message: types.Message, pool: asyncpg.Pool) -> None:
-    """Обробляє команду /start та підписує користувача на новини."""
+    """Обробляє команду /start, підписує користувача та пропонує обрати preferred стиль."""
     chat_id = message.chat.id
     try:
+        # Вставка або оновлення підписки
         await pool.execute(
             "INSERT INTO subscribers (chat_id) VALUES ($1) ON CONFLICT (chat_id) DO NOTHING",
             chat_id
         )
         await message.answer(
-            "Ласкаво просимо! Ви успішно підписалися на щогодинну аналітику від експертів (Віталій Портников / Ігор Лібсіц).",
-            parse_mode=ParseMode.HTML
+            "Ласкаво просимо! Ви успішно підписалися на щогодинну аналітику від експертів.\n"
+            "Оберіть ваш preferred стиль новин:",
+            reply_markup=get_preference_keyboard()
         )
     except Exception as e:
         logger.error(f"Помилка підписки користувача {chat_id}: {e}")
         await message.answer("Виникла помилка при оформленні підписки. Спробуйте пізніше.")
+
+
+@router.callback_query(lambda c: c.data and c.data.startswith('set_expert_'))
+async def process_expert_choice(callback_query: types.CallbackQuery, pool: asyncpg.Pool):
+    """Обробляє вибір preferred стилю новин користувачем через інлайн-клавіатуру."""
+    chat_id = callback_query.message.chat.id
+    # Витягуємо preferred: 'set_expert_portnikov' -> 'portnikov'
+    preference = callback_query.data.split('_')[-1] 
+    
+    # Використовуємо словник для відображення назв
+    preference_map = {
+        EXPERT_POLITICAL: "Політика (Портников)",
+        EXPERT_ECONOMIC: "Економіка (Лібсіц)",
+        EXPERT_MIXED: "Змішаний (Рандом)"
+    }
+    preference_title = preference_map.get(preference, preference.capitalize())
+    
+    try:
+        await pool.execute(
+            "UPDATE subscribers SET expert_preference = $1 WHERE chat_id = $2",
+            preference,
+            chat_id
+        )
+        await callback_query.answer(f"Ваш preferred стиль встановлено: {preference_title}")
+        
+        # Редагуємо повідомлення, щоб прибрати клавіатуру і показати результат
+        await callback_query.message.edit_text(
+            f"✅ Ви підписані. Ваш preferred стиль: **{preference_title}**. "
+            f"Щогодини ви отримуватимете нову аналітику.",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+    except Exception as e:
+        logger.error(f"Помилка оновлення preferred користувача {chat_id}: {e}")
+        await callback_query.answer("Виникла помилка. Спробуйте пізніше.", show_alert=True)
+
+
+async def get_user_preference(pool: asyncpg.Pool, chat_id: int) -> Optional[str]:
+    """Отримує preferred стиль новин користувача."""
+    preference = await pool.fetchval(
+        "SELECT expert_preference FROM subscribers WHERE chat_id = $1", 
+        chat_id
+    )
+    # Повертає preferred або None, якщо користувач не підписаний/не має preference
+    return preference
+
+@router.message(Command("news"))
+async def command_news_handler(message: types.Message, pool: asyncpg.Pool, bot: Bot):
+    """Обробляє команду /news та генерує новину негайно, використовуючи preferred користувача."""
+    chat_id = message.chat.id
+    
+    preference = await get_user_preference(pool, chat_id)
+    if not preference:
+        await message.answer("Ви не підписані або не обрали preferred стиль. Виконайте команду /start.")
+        return
+
+    # Імітуємо набір тексту, поки триває генерація
+    await bot.send_chat_action(chat_id, "typing")
+    await message.answer(f"🔄 Генерую аналітику ({preference.capitalize()})...")
+
+    try:
+        # Генерація новини на основі preferred
+        news_message = await generate_expert_news(preference) 
+        
+        if news_message:
+            await message.answer(news_message, parse_mode=ParseMode.MARKDOWN_V2)
+        else:
+            await message.answer("❌ Не вдалося згенерувати аналітику. Спробуйте пізніше або перевірте API ключ.")
+            
+    except Exception as e:
+        logger.error(f"Помилка обробки /news для {chat_id}: {e}")
+        await message.answer("Виникла критична помилка під час генерації. Спробуйте пізніше.")
+
 
 @router.message(Command("stop"))
 async def command_stop_handler(message: types.Message, pool: asyncpg.Pool) -> None:
@@ -94,6 +190,28 @@ async def command_stop_handler(message: types.Message, pool: asyncpg.Pool) -> No
     except Exception as e:
         logger.error(f"Помилка відписки користувача {chat_id}: {e}")
         await message.answer("Виникла помилка при скасуванні підписки. Спробуйте пізніше.")
+
+@router.message(Command("stats"))
+async def command_stats_handler(message: types.Message, pool: asyncpg.Pool) -> None:
+    """Обробляє команду /stats (для адміна) та показує статистику підписників."""
+    chat_id = message.chat.id
+    
+    # Перевірка на адміністратора (порівняння ID)
+    if chat_id != ADMIN_ID:
+        await message.answer("Ця команда доступна лише адміністратору.")
+        return
+
+    try:
+        count = await pool.fetchval("SELECT COUNT(*) FROM subscribers")
+        # Використовуємо MarkdownV2 та екрануємо символи
+        await message.answer(
+            f"\\*\\*📊 Статистика Підписників\\*\\*\n"
+            f"Всього активних підписників: `{count}`",
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+    except Exception as e:
+        logger.error(f"Помилка отримання статистики: {e}")
+        await message.answer("Виникла помилка при отриманні статистики.")
 
 
 # --- 4. ФУНКЦІЇ ДЛЯ ГЕНЕРАЦІЇ ТА РОЗСИЛКИ НОВИН (GEMINI API) ---
@@ -168,20 +286,22 @@ async def call_gemini_api(system_prompt: str, user_query: str) -> Optional[str]:
     logger.error("Не вдалося викликати Gemini API після кількох спроб.")
     return None
 
-async def generate_expert_news() -> Optional[str]:
-    """Генерує новину-аналітику, комбінуючи стилі Портникова та Лібсіца."""
+async def generate_expert_news(expert_choice: Optional[str] = None) -> Optional[str]:
+    """Генерує новину-аналітику, використовуючи обраний або випадковий стиль."""
     
-    expert_choice = random.choice(['portnikov', 'libsits', 'mixed'])
+    if expert_choice is None or expert_choice == EXPERT_MIXED:
+        # Для scheduled розсилки або коли обрано "mixed", вибираємо випадково (або mixed)
+        expert_choice = random.choice([EXPERT_POLITICAL, EXPERT_ECONOMIC, EXPERT_MIXED])
     
-    if expert_choice == 'portnikov':
+    if expert_choice == EXPERT_POLITICAL:
         system_prompt = "Ви — глибокий політичний оглядач, в стилі Віталія Портникова. Створіть стислу, аналітичну новину про актуальні політичні події в Україні чи світі. Тон має бути серйозним, прогнозуючим, з акцентом на історичні паралелі та геополітичні наслідки. Відповідь має бути лише текстом новини, відформатованим за правилами **MarkdownV2** (використовуйте \\*\\*жирний шрифт\\*\\* для виділення). Не використовуйте заголовки."
         user_query = "Напиши одну аналітичну новину на основі останніх політичних подій."
         title = "Політична Аналітика"
-    elif expert_choice == 'libsits':
+    elif expert_choice == EXPERT_ECONOMIC:
         system_prompt = "Ви — провідний економічний експерт та професор, в стилі Ігоря Лібсіца. Створіть стислу, але ґрунтовну економічну новину-прогноз для України, використовуючи економічні терміни та реальні дані. Тон має бути прагматичним та трохи критичним. Відповідь має бути лише текстом новини, відформатованим за правилами **MarkdownV2** (використовуйте \\*\\*жирний шрифт\\*\\* для виділення). Не використовуйте заголовки."
         user_query = "Напиши одну економічну новину-прогноз на основі поточних економічних тенденцій в Україні."
         title = "Економічний Прогноз"
-    else: # mixed
+    else: # mixed (якщо викликано з preference, але тут він вже має бути або political, або economic, це запасний варіант)
         system_prompt = "Ви — аналітик, що поєднує політичну глибину Віталія Портникова та економічний прагматизм Ігоря Лібсіца. Створіть одну, комплексну новину, яка аналізує політичні рішення через призму їхніх економічних наслідків. Відповідь має бути лише текстом новини, відформатованим за правилами **MarkdownV2** (використовуйте \\*\\*жирний шрифт\\*\\* для виділення). Не використовуйте заголовки."
         user_query = "Напиши одну комплексну новину-аналітичну статтю, що поєднує політику та економіку."
         title = "Комплексний Огляд"
@@ -228,9 +348,9 @@ async def news_poster(app: web.Application):
             logger.info(f"Очікування {wait_seconds:.0f} секунд до наступного запуску ({next_hour.strftime('%H:%M:%S')}).")
             await asyncio.sleep(wait_seconds)
 
-            # 2. Generate News
+            # 2. Generate News (без preferred, буде обрано випадково)
             logger.info("Час прийшов. Запуск генерації новин...")
-            news_message = await generate_expert_news()
+            news_message = await generate_expert_news(expert_choice=None) # Вибір випадковий/змішаний
             
             if news_message:
                 # 3. Get Subscribers
@@ -293,7 +413,6 @@ async def on_startup(app: web.Application):
     # 2. Встановлення Webhook
     if not WEBHOOK_HOST or WEBHOOK_HOST == "https://placeholder-host.com/":
         logger.critical("WEBHOOK_HOST environment variable is NOT set correctly. Webhook не буде налаштовано.")
-        # Можна використати тут Long Polling, але для Webhook середовища це краще пропустити.
         return 
         
     try:
@@ -373,7 +492,7 @@ async def main():
     app["pool"] = pool
     app["session"] = session
 
-    # 4. Реєстрація залежностей для хендлерів
+    # 4. Реєстрація залежностей для хендлерів (тепер passed 'bot' to message handlers is crucial for /news)
     dp.message.outer_middleware.register(lambda handler, event, data: {**data, 'session': session, 'pool': pool, 'bot': bot})
     dp.callback_query.outer_middleware.register(lambda handler, event, data: {**data, 'pool': pool, 'bot': bot})
     
