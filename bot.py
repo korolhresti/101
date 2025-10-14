@@ -9,8 +9,7 @@ from typing import Dict, Any, List, Optional, Tuple
 
 import asyncpg
 import aiohttp
-from aiohttp import ClientSession, web
-from aiohttp.web import Application, Request, Response # Додано для ясності типів aiohttp
+from aiohttp import ClientSession, web # Unified import: ClientSession for Gemini/RSS, web for server
 import feedparser
 from bs4 import BeautifulSoup
 
@@ -39,16 +38,28 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "") 
 
 # Конфігурація Webhook для Render
+# WEBHOOK_HOST повинен бути встановлений як повний домен (наприклад, https://my-app.onrender.com)
 WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
 WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
 WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
 
-if not (BOT_TOKEN and WEBHOOK_HOST and DATABASE_URL):
-    logger.error("Критичні змінні оточення (BOT_TOKEN, WEBHOOK_HOST, DATABASE_URL) не встановлені.")
+# --- ПЕРЕВІРКА КРИТИЧНИХ ЗМІННИХ ТА ФОРМУВАННЯ WEBHOOK URL ---
+if not (BOT_TOKEN and DATABASE_URL):
+    logger.error("Критичні змінні оточення (BOT_TOKEN, DATABASE_URL) не встановлені.")
     sys.exit(1)
 
+if not WEBHOOK_HOST:
+    logger.critical("Критична змінна оточення WEBHOOK_HOST (повний домен) не встановлена. Webhook не буде працювати.")
+    sys.exit(1)
+    
 WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
+
+# Гарантуємо, що WEBHOOK_HOST має схему (https)
+if not WEBHOOK_HOST.startswith(('http://', 'https://')):
+    WEBHOOK_HOST = 'https://' + WEBHOOK_HOST
+    
 WEBHOOK_URL = urljoin(WEBHOOK_HOST, WEBHOOK_PATH)
+
 
 # Константа для новинного RSS-фіда (припустімо, це популярне українське ЗМІ)
 # УВАГА: Замініть на актуальну RSS-стрічку популярного ресурсу.
@@ -71,7 +82,6 @@ class GeminiClient:
     async def _call_api(self, prompt: str, system_instruction: str) -> Optional[str]:
         """Універсальний метод для виклику Gemini API."""
         
-        # ВИПРАВЛЕНО СИНТАКСИЧНУ ПОМИЛКУ у словнику payload
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "systemInstruction": {"parts": [{"text": system_instruction}]},
@@ -135,11 +145,12 @@ class GeminiClient:
 # --- 3. ФУНКЦІЇ ВЗАЄМОДІЇ З БАЗОЮ ДАНИХ (asyncpg) ---
 
 async def init_db(pool: asyncpg.Pool):
-    """Створення таблиць, якщо вони не існують."""
+    """Створення таблиць, якщо вони не існують. ДОДАНО КОЛОНКУ KEYWORDS."""
     await pool.execute('''
         CREATE TABLE IF NOT EXISTS subscribers (
             user_id BIGINT PRIMARY KEY,
-            subscribed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            subscribed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+            keywords TEXT[] DEFAULT '{}' -- Нова колонка для ключових слів (фільтрація)
         );
     ''')
     await pool.execute('''
@@ -164,16 +175,34 @@ async def mark_news_as_published(pool: asyncpg.Pool, guid: str):
         guid
     )
 
-async def get_subscribers(pool: asyncpg.Pool) -> List[int]:
-    """Отримує список ID всіх підписників."""
-    records = await pool.fetch("SELECT user_id FROM subscribers")
-    return [r['user_id'] for r in records]
+async def get_all_subscribers_with_filters(pool: asyncpg.Pool) -> List[Tuple[int, List[str]]]:
+    """Отримує список ID підписників та їхніх ключових слів."""
+    records = await pool.fetch("SELECT user_id, keywords FROM subscribers")
+    return [(r['user_id'], r['keywords'] if r['keywords'] is not None else []) for r in records]
+
+
+async def set_user_keywords(pool: asyncpg.Pool, user_id: int, keywords: List[str]):
+    """Встановлює ключові слова для фільтрації новин."""
+    await pool.execute(
+        "UPDATE subscribers SET keywords = $1 WHERE user_id = $2",
+        keywords, user_id
+    )
+
+async def get_user_keywords(pool: asyncpg.Pool, user_id: int) -> List[str]:
+    """Отримує поточні ключові слова користувача."""
+    keywords = await pool.fetchval(
+        "SELECT keywords FROM subscribers WHERE user_id = $1",
+        user_id
+    )
+    return keywords if keywords is not None else []
+
 
 async def subscribe_user(pool: asyncpg.Pool, user_id: int) -> bool:
     """Додає користувача до підписників."""
     try:
+        # При підписці, якщо запис існує, оновлюємо дату
         await pool.execute(
-            "INSERT INTO subscribers (user_id) VALUES ($1) ON CONFLICT (user_id) DO NOTHING",
+            "INSERT INTO subscribers (user_id) VALUES ($1) ON CONFLICT (user_id) DO UPDATE SET subscribed_at = CURRENT_TIMESTAMP",
             user_id
         )
         return True
@@ -246,7 +275,7 @@ async def fetch_and_parse_news(session: ClientSession) -> List[NewsItem]:
         return []
 
 async def process_and_publish_news(bot: Bot, pool: asyncpg.Pool, session: ClientSession):
-    """Основна функція для планувальника: завантаження, AI-обробка та розсилка."""
+    """Оновлена функція: AI-обробка лише нових новин та персоналізована розсилка."""
     
     logger.info("Запуск планувальника новин...")
     
@@ -259,54 +288,44 @@ async def process_and_publish_news(bot: Bot, pool: asyncpg.Pool, session: Client
     # 2. Фільтрування вже опублікованих новин
     news_to_process = []
     for item in all_news:
-        if not await is_news_published(pool, item.guid):
-            news_to_process.append(item)
+        # Обмежуємо обробку новин, які вийшли не пізніше останніх 24 годин
+        if item.published > (datetime.now(KYIV_TZ) - timedelta(hours=24)):
+            if not await is_news_published(pool, item.guid):
+                news_to_process.append(item)
             
     if not news_to_process:
         logger.info("Усі останні новини вже опубліковані.")
         return
 
-    # Обмеження кількості новин для обробки, щоб не перевантажувати API
+    # Обмеження кількості новин для обробки
     news_to_publish = news_to_process[:MAX_NEWS_TO_PROCESS]
     
     logger.info(f"Знайдено {len(news_to_publish)} нових новин для обробки AI.")
     
     gemini_client = GeminiClient(session, GEMINI_API_KEY)
-    subscribers = await get_subscribers(pool)
     
-    if not subscribers:
-        logger.warning("Немає активних підписників. Новини не будуть розіслані.")
-        # Все одно позначаємо як опубліковані, щоб не було дублів при появі першого підписника
-        for item in news_to_publish:
-            await mark_news_as_published(pool, item.guid)
-        return
-
-    # 3. AI-обробка та розсилка
+    # 3. AI-обробка та кешування результатів
+    # Кеш для зберігання результатів AI-обробки (повного тексту повідомлення)
+    processed_news: Dict[str, Dict[str, str]] = {} 
+    
     for item in news_to_publish:
         logger.info(f"Обробка AI: {item.title}")
         
-        # AI-генерування
         engagement_text, hashtags = await gemini_client.analyze_news_content(item.title, item.summary)
         
         if not engagement_text:
-            logger.error(f"AI не змогло обробити новину: {item.title}. Пропуск розсилки.")
-            continue # Пропускаємо цю новину
+            logger.error(f"AI не змогло обробити новину: {item.title}. Пропуск.")
+            continue
             
         # Формування фінального тексту повідомлення
-        
-        # Розбиття на підсумок та залучення
         try:
             summary, engagement_question = engagement_text.split('\n\n', 1)
         except ValueError:
-            # На випадок, якщо AI не дотрималося формату
             summary = engagement_text
             engagement_question = "Яка ваша думка щодо цього?"
-            logger.warning("AI не надало дискусійне питання. Використано стандартне.")
         
-        # Хештеги
         hashtag_line = f"\n\n**Хештеги:** {hashtags}" if hashtags else ""
 
-        # УВАГА: Telegram-боти мають обмеження на довжину повідомлень.
         message_text = (
             f"**📰 TOP НОВИНА:** {item.title}\n\n"
             f"{summary}\n\n"
@@ -314,41 +333,87 @@ async def process_and_publish_news(bot: Bot, pool: asyncpg.Pool, session: Client
             f"**❓ Залучення:** *{engagement_question.strip()}*\n"
             f"{hashtag_line}"
         )
+        
+        # Кешування результату та тексту для фільтрації
+        processed_news[item.guid] = {
+            "text": message_text, 
+            # Комбінований рядок для швидкої перевірки ключових слів
+            "summary_for_filter": f"{item.title.lower()} {item.summary.lower()}"
+        }
+        
+        # Позначити як опубліковану одразу після обробки, щоб уникнути повторного AI-запуску
+        await mark_news_as_published(pool, item.guid) 
 
-        # 4. Розсилка підписникам
-        logger.info(f"Розсилка новини '{item.title}' {len(subscribers)} підписникам.")
+    if not processed_news:
+        logger.info("Усі нові новини не змогли бути оброблені AI.")
+        return
+
+    # 4. Розсилка підписникам з урахуванням фільтрів
+    subscribers_with_filters = await get_all_subscribers_with_filters(pool)
+    
+    if not subscribers_with_filters:
+        logger.warning("Немає активних підписників. Розсилка не виконана.")
+        return
+
+    for user_id, keywords in subscribers_with_filters:
+        news_for_user = []
         
-        for user_id in subscribers:
-            try:
-                # Оновлено ParseMode на MARKDOWN, щоб використовувати **жирний**
-                await bot.send_message(
-                    chat_id=user_id,
-                    text=message_text,
-                    parse_mode=ParseMode.MARKDOWN
-                )
-            except Exception as e:
-                logger.warning(f"Не вдалося надіслати повідомлення користувачу {user_id}: {e}")
+        if not keywords: # Якщо фільтрів немає, надсилаємо всі оброблені новини
+            news_for_user = list(processed_news.values())
+        else:
+            lower_keywords = [k.strip().lower() for k in keywords if k.strip()]
+            
+            for data in processed_news.values():
+                # Перевірка наявності будь-якого ключового слова в заголовку/описі
+                match_found = False
+                for keyword in lower_keywords:
+                    # Проста перевірка входження підрядка
+                    if keyword in data["summary_for_filter"]:
+                        match_found = True
+                        break
+                
+                if match_found:
+                    news_for_user.append(data)
         
-        # 5. Позначити як опубліковану
-        await mark_news_as_published(pool, item.guid)
+        if news_for_user:
+            filter_display = ", ".join(keywords) if keywords else "НЕТ"
+            logger.info(f"Розсилка {len(news_for_user)} новин користувачу {user_id}. Фільтри: {filter_display}")
+            
+            for news_data in news_for_user:
+                try:
+                    await bot.send_message(
+                        chat_id=user_id,
+                        text=news_data["text"],
+                        parse_mode=ParseMode.MARKDOWN
+                    )
+                except Exception as e:
+                    logger.warning(f"Не вдалося надіслати повідомлення користувачу {user_id}: {e}")
+                await asyncio.sleep(0.05)
+        # else: news_for_user is empty, user gets no news this cycle
 
 async def news_scheduler(bot: Bot, pool: asyncpg.Pool, session: ClientSession):
     """Нескінченний цикл для періодичної перевірки новин."""
+    # ПЕРША ПЕРЕВІРКА ПРИ ЗАПУСКУ
+    await process_and_publish_news(bot, pool, session)
+    
     while True:
         try:
+            # ЧЕКАЄМО ПЕРІОД, ПЕРШ НІЖ ПОВТОРЮВАТИ
+            await asyncio.sleep(NEWS_INTERVAL_SECONDS)
             await process_and_publish_news(bot, pool, session)
         except Exception as e:
             logger.error(f"Помилка в циклі планувальника новин: {e}")
         
-        await asyncio.sleep(NEWS_INTERVAL_SECONDS)
-
-
 # --- 5. AIOGRAM ХЕНДЛЕРИ (РОУТЕРИ) ---
 
 router = Router()
 
+# Стан для керування процесом встановлення фільтрів
+class FilterStates(StatesGroup):
+    waiting_for_keywords = State()
+
 @router.message(CommandStart())
-async def handle_start(message: types.Message, pool: asyncpg.Pool, bot: Bot):
+async def handle_start(message: types.Message, pool: asyncpg.Pool):
     """Обробник команди /start. Вітає та пропонує підписку."""
     user_id = message.from_user.id
     
@@ -358,15 +423,94 @@ async def handle_start(message: types.Message, pool: asyncpg.Pool, bot: Bot):
     response = (
         f"👋 **Вітаю, {message.from_user.full_name}!**\n\n"
         "Я — ваш *AI News Aggregator Bot*. Моя місія — знаходити найактуальніші та найпопулярніші "
-        "новини з українських джерел, обробляти їх через **Gemini AI** для **стислого підсумку**, "
-        "додавати **трендові хештеги** та **залучаючі питання** для дискусії.\n\n"
-        "**✅ Ви автоматично підписані!**\n\n"
-        "**Команди:**\n"
-        "/subscribe - Підписатися на щогодинні AI-новини.\n"
+        "новини, обробляти їх через **Gemini AI** для **стислого підсумку** та **залучаючих питань**.\n\n"
+        "✅ **Ви автоматично підписані!**\n\n"
+        "**Новий функціонал (Фільтри):**\n"
+        "/set_filter - Встановити ключові слова для персоналізованої розсилки.\n"
+        "/my_filter - Переглянути поточний фільтр.\n"
+        "/clear_filter - Очистити фільтр (отримувати всі новини).\n\n"
+        "**Основні команди:**\n"
         "/unsubscribe - Відписатися від розсилки.\n"
         "/status - Перевірити статус підписки."
     )
     await message.answer(response, parse_mode=ParseMode.MARKDOWN)
+
+@router.message(Command("set_filter"))
+async def cmd_set_filter(message: types.Message, state: FSMContext, pool: asyncpg.Pool):
+    """Початок процесу встановлення ключових слів."""
+    user_id = message.from_user.id
+    # Перевіряємо підписку
+    if not await pool.fetchval("SELECT EXISTS(SELECT 1 FROM subscribers WHERE user_id = $1)", user_id):
+         await message.answer("ℹ️ Спочатку вам потрібно /subscribe, щоб мати можливість встановлювати фільтри.")
+         return
+         
+    current_keywords = await get_user_keywords(pool, user_id)
+    current_display = ", ".join(current_keywords) if current_keywords else "не встановлені (Ви отримуєте всі новини)"
+    
+    response = (
+        "🔑 **Встановлення фільтра новин.**\n\n"
+        "Надішліть мені ключові слова, які вас цікавлять, **розділені комою** (наприклад: *політика, економіка, IT, Євросоюз*).\n"
+        "Я надсилатиму лише ті новини, у заголовку чи описі яких є ці слова.\n\n"
+        f"**Поточні слова:** *{current_display}*"
+    )
+    await message.answer(response, parse_mode=ParseMode.MARKDOWN)
+    await state.set_state(FilterStates.waiting_for_keywords)
+
+@router.message(FilterStates.waiting_for_keywords, F.text)
+async def process_keywords(message: types.Message, state: FSMContext, pool: asyncpg.Pool):
+    """Обробка введених ключових слів та збереження їх у БД."""
+    raw_keywords = message.text
+    
+    # Очищення та нормалізація: видалення зайвих пробілів, переведення в нижній регістр, фільтрація порожніх
+    keywords = [
+        k.strip().lower() 
+        for k in raw_keywords.split(',') 
+        if k.strip()
+    ]
+    
+    if not keywords:
+        # Якщо користувач надіслав порожній рядок або лише коми
+        await message.answer("❌ Будь ласка, введіть принаймні одне ключове слово, розділене комою, або скасуйте дію командою /clear_filter.")
+        return
+
+    await set_user_keywords(pool, message.from_user.id, keywords)
+    await state.clear()
+    
+    display_keywords = ", ".join(keywords)
+    await message.answer(
+        f"✅ **Фільтр встановлено!**\n"
+        f"Тепер ви будете отримувати новини, що містять: **{display_keywords}**.\n\n"
+        "Щоб змінити, використайте /set_filter знову. Щоб вимкнути фільтр та отримувати всі новини, використайте /clear_filter.",
+        parse_mode=ParseMode.MARKDOWN
+    )
+
+@router.message(Command("my_filter"))
+async def cmd_my_filter(message: types.Message, pool: asyncpg.Pool):
+    """Показує поточний фільтр користувача."""
+    keywords = await get_user_keywords(pool, message.from_user.id)
+    
+    if not keywords:
+        await message.answer(
+            "ℹ️ **Ваш фільтр не встановлено.** Ви отримуєте *всі* AI-оброблені новини.\n"
+            "Використайте /set_filter для налаштування.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+    else:
+        display_keywords = ", ".join(keywords)
+        await message.answer(
+            f"🔑 **Ваші поточні ключові слова:** **{display_keywords}**.\n\n"
+            "Ви отримуєте новини, що містять ці слова.",
+            parse_mode=ParseMode.MARKDOWN
+        )
+
+@router.message(Command("clear_filter"))
+async def cmd_clear_filter(message: types.Message, pool: asyncpg.Pool):
+    """Очищає фільтр користувача."""
+    await set_user_keywords(pool, message.from_user.id, [])
+    await message.answer(
+        "🗑️ **Фільтр очищено.** Тепер ви будете отримувати *всі* AI-оброблені новини.",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 @router.message(Command("subscribe"))
 async def handle_subscribe(message: types.Message, pool: asyncpg.Pool):
@@ -395,9 +539,16 @@ async def handle_status(message: types.Message, pool: asyncpg.Pool):
     """Перевіряє статус підписки користувача."""
     user_id = message.from_user.id
     is_subscribed = await pool.fetchval("SELECT EXISTS(SELECT 1 FROM subscribers WHERE user_id = $1)", user_id)
+    keywords = await get_user_keywords(pool, user_id)
+
     
     if is_subscribed:
-        response = "✅ **Ваш статус:** Ви підписані на розсилку AI-новин."
+        filter_status = ", ".join(keywords) if keywords else "❌ ВІДСУТНІ (отримуєте всі новини)"
+        response = (
+            "✅ **Ваш статус:** Ви підписані на розсилку AI-новин.\n"
+            f"🔑 **Ваш фільтр:** *{filter_status}*\n\n"
+            "Використовуйте /set_filter для зміни."
+        )
     else:
         response = "❌ **Ваш статус:** Ви не підписані. Скористайтеся /subscribe, щоб отримувати новини."
         
@@ -409,9 +560,12 @@ async def handle_general_text(message: types.Message):
     response = (
         "🤖 Я бот-агрегатор новин. Моя основна функція — розсилка AI-оброблених новин.\n"
         "Скористайтеся командами:\n"
-        "/subscribe\n"
-        "/unsubscribe\n"
-        "/status"
+        "/set_filter - Встановити фільтр\n"
+        "/my_filter - Переглянути фільтр\n"
+        "/clear_filter - Очистити фільтр\n"
+        "/subscribe - Підписатися\n"
+        "/unsubscribe - Відписатися\n"
+        "/status - Статус"
     )
     await message.answer(response)
 
@@ -445,7 +599,14 @@ async def on_startup(app: web.Application):
     
     # 2. Встановлення Webhook
     logger.info(f"Встановлення Webhook на URL: {WEBHOOK_URL}")
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    try:
+        # Встановлення Webhook
+        await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+    except Exception as e:
+        logger.critical(f"Помилка встановлення Webhook: {e}")
+        # Якщо webhook не встановлено, ми не можемо продовжувати.
+        sys.exit(1)
+
 
     # 3. Запуск фонового планувальника новин
     # Створюємо завдання, яке буде виконуватися у фоні
@@ -481,7 +642,8 @@ async def main():
     """Основна функція запуску програми."""
     
     # Ініціалізація Bot, Dispatcher
-    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    # Використовуємо ParseMode.MARKDOWN за замовчуванням, оскільки він більш поширений.
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher()
     dp.include_router(router) # Додавання роутера
 
@@ -508,6 +670,7 @@ async def main():
 
     # 4. Реєстрація залежностей для хендлерів DP
     # Використовуємо .update.middleware.register для ін'єкції ресурсів у всі хендлери
+    # FSMContext не потрібно явно передавати через data, aiogram це робить автоматично
     dp.update.middleware.register(lambda handler, event, data: {
         **data, 
         'pool': pool, 
@@ -540,4 +703,6 @@ if __name__ == '__main__':
     except KeyboardInterrupt:
         logger.info("Бот зупинено користувачем.")
     except Exception as e:
-        logger.critical(f"Загальна помилка виконання: {e}")
+        # Якщо main() завершується через sys.exit(1), тут може бути перехоплено SystemExit, 
+        # але ми намагаємося логувати критичні помилки раніше.
+        logger.error(f"Загальна помилка виконання: {e}")
