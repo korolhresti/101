@@ -10,6 +10,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import asyncpg
 import aiohttp
 from aiohttp import ClientSession, web
+from aiohttp.web import Application, Request, Response # Додано для ясності типів aiohttp
 import feedparser
 from bs4 import BeautifulSoup
 
@@ -71,7 +72,7 @@ class GeminiClient:
         """Універсальний метод для виклику Gemini API."""
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "systemInstruction": {"parts": [{"text": system_instruction}]},
+            "systemInstruction": {"parts": [{"text: system_instruction}]}},
             "tools": [{"google_search": {}}], # Заземлення через Google Search для актуальності
         }
         
@@ -218,6 +219,7 @@ async def fetch_and_parse_news(session: ClientSession) -> List[NewsItem]:
                     clean_summary = soup.get_text().strip()
                     
                     # Визначення часу публікації (з використанням utc_to_dt та переведенням до Kyiv Timezone)
+                    # NOTE: feedparser.published_parsed повертає time.struct_time в UTC
                     published_dt = datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).astimezone(KYIV_TZ)
                     
                     # Використання link або guid як унікального ідентифікатора (GUID)
@@ -496,9 +498,14 @@ async def main():
     app["session"] = session
 
     # 4. Реєстрація залежностей для хендлерів DP
-    # Це гарантує, що pool і session доступні у функціях-обробниках
-    router.message.middleware.inject({'pool': pool, 'session': session, 'bot': bot})
-    router.callback_query.middleware.inject({'pool': pool, 'session': session, 'bot': bot})
+    # Це гарантує, що pool, session, і bot доступні у функціях-обробниках
+    # ВИПРАВЛЕНО: Використовуємо dp.update.middleware.register для ін'єкції ресурсів (замість застарілого .inject())
+    dp.update.middleware.register(lambda handler, event, data: {
+        **data, 
+        'pool': pool, 
+        'session': session, 
+        'bot': bot
+    })
     
     # 5. Реєстрація маршруту для вебхука
     app.router.add_post(WEBHOOK_PATH, handle_webhook)
