@@ -9,57 +9,77 @@ from typing import List, Dict, Any, Tuple, Set
 
 import asyncpg
 import aiohttp
-from aiohttp import web 
+from aiohttp import web
 import feedparser
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+import pymorphy3
+from thefuzz import fuzz
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
-from aiogram.client.default import DefaultBotProperties 
+from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramAPIError
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 
-# Завантаження змінних оточення (для локального тестування)
-load_dotenv() 
+# --- 0. PRE-CONFIGURATION ---
 
-# --- 1. НАЛАШТУВАННЯ І КОНСТАНТИ ---
+# Завантаження змінних оточення (для локального тестування)
+load_dotenv()
+
+# Налаштування морфологічного аналізатора для української мови
+morph = pymorphy3.MorphAnalyzer(lang='uk')
+
+# Налаштування логування
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(filename)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 # Використовуйте Kyiv time zone (UTC+3)
 KYIV_TZ = timezone(timedelta(hours=3), 'Europe/Kyiv')
-# Формат часу для відображення
-TIME_FORMAT = "%H:%M" 
+
+
+# --- 1. CONFIGURATION AND CONSTANTS ---
 
 class Config:
-    """Конфігурація професійної платформи."""
-    
+    """Конфігурація платформи, зібрана в одному місці."""
+
     # ⚙️ ОСНОВНІ ПАРАМЕТРИ ЦИКЛУ
-    POSTING_INTERVAL_MIN = 5  # Кожні 5 хвилин (Оптимально)
-    MAX_NEWS_PER_CYCLE = 3   # СТРОГИЙ ЛІМІТ: До 3 новин за цикл (ТОП-3)
-    MAX_AGE_MIN = 30          # Не публікувати новини старше 30 хвилин (Фільтр свіжості)
-    
+    POSTING_INTERVAL_MIN = 5   # Кожні 5 хвилин
+    MAX_NEWS_PER_CYCLE = 3     # СТРОГИЙ ЛІМІТ: До 3 новин за цикл (ТОП-3)
+    MAX_AGE_MIN = 45           # Не публікувати новини старше 45 хвилин (розширено для гнучкості)
+    MIN_TITLE_LENGTH = 20      # Мінімальна довжина заголовка для фільтрації клікбейту
+
     # 🛡️ ПАРАМЕТРИ НАДІЙНОСТІ ТА ПРОДУКТИВНОСТІ
-    FETCH_LIMIT = 30          # Макс. кількість записів для обробки з одного RSS-фіда
-    NUM_SOURCES_TO_FETCH = 24 # Кількість випадкових джерел, які парсяться за цикл
-    HTTP_TIMEOUT = 15         # Таймаут для HTTP-запитів
-    MAX_CONCURRENCY = 15      # Макс. одночасних з'єднань для парсингу
-    
+    FETCH_LIMIT = 25           # Макс. кількість записів для обробки з одного RSS-фіда
+    NUM_SOURCES_TO_FETCH = 24  # Кількість випадкових джерел, які парсяться за цикл
+    HTTP_TIMEOUT = 12          # Таймаут для HTTP-запитів (трохи збільшено)
+    MAX_CONCURRENCY = 25       # Макс. одночасних з'єднань для парсингу
+    MAX_RETRIES = 3            # Макс. кількість повторних спроб для HTTP-запиту
+    RETRY_DELAY_SEC = 2        # Початкова затримка повтору (з експоненційною витримкою)
+    DUPLICATE_TITLE_THRESHOLD = 85 # Поріг схожості заголовків для визначення дублікатів (у %)
+
     # 💾 ПАРАМЕТРИ ОБСЛУГОВУВАННЯ БАЗИ ДАНИХ (Оптимізація Neon)
-    DB_POOL_MIN = 1           
-    DB_POOL_MAX = 5           
-    DB_CLEANUP_DAYS = 7       
-    CLEANUP_INTERVAL_HOURS = 1 
-    
+    DB_POOL_MIN = 2            # Мінімальний розмір пулу
+    DB_POOL_MAX = 7            # Максимальний розмір пулу (для кращої конкурентності)
+    DB_CLEANUP_DAYS = 7        # Видаляти записи новин старше 7 днів
+    CLEANUP_INTERVAL_HOURS = 2 # Частота очистки БД
+
+    # ❌ ПАРАМЕТРИ БЛОКУВАННЯ ДЖЕРЕЛ (Економія Compute Time)
+    BLOCKED_HTTP_CODES = [403, 404, 500, 503]
+    SOURCE_BLOCK_THRESHOLD = 5 # Кількість помилок, після яких джерело блокується
+    SOURCE_BLOCK_DURATION_HOURS = 3 # На скільки годин блокувати джерело
+
     DEFAULT_HEADERS = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36 NewsAggregatorBot (+https://t.me/YourNewsBotChannel)', 
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 UkrainianNewsBot/1.0 (+https://t.me/YourNewsBotChannel)',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
         'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
     }
-    
-    # 1. 📰 Джерела новин (Оновлений список)
+
+    # 📰 Джерела новин (Оновлений список)
     SOURCES: List[str] = [
-        "https://tsn.ua/rss/all.xml", "https://www.pravda.com.ua/rss/news/", 
+        "https://tsn.ua/rss/all.xml", "https://www.pravda.com.ua/rss/news/",
         "https://censor.net/rss/all_news", "https://www.rbc.ua/static/rss/all.xml",
         "https://www.ukrinform.ua/rss/all.xml", "https://www.liga.net/rss/news.xml",
         "https://www.obozrevatel.com/rss/main.xml", "https://minfin.com.ua/rss/news/",
@@ -67,41 +87,36 @@ class Config:
         "https://gazeta.ua/rss/all", "https://24tv.ua/rss/all.xml",
         "https://nv.ua/ukr/rss/all.xml", "https://delo.ua/rss/all.xml",
         "https://suspilne.media/feed/", "https://www.bbc.com/ukrainian/rss.xml",
-        "https://news.finance.ua/ua/rss", "https://www.unian.ua/rss/news.rss", 
-        "https://ua.interfax.com.ua/news/ukraine.rss", 
-        "https://hromadske.ua/feed/news", "https://biz.censor.net/rss",
-        "https://slovoidilo.ua/rss/index.xml", "https://apostrophe.ua/rss",
-        "https://babel.ua/rss" # Додано babel.ua
+        "https://news.finance.ua/ua/rss", "https://www.unian.ua/rss/news.rss",
+        "https://ua.interfax.com.ua/news/ukraine.rss", "https://hromadske.ua/feed/news",
+        "https://biz.censor.net/rss", "https://slovoidilo.ua/rss/index.xml",
+        "https://apostrophe.ua/rss", "https://babel.ua/rss"  # <-- ДОДАНО
     ]
 
 
-# Налаштування логування
-logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-# --- WEBHOOK І СЕРВІСНІ ЗМІННІ СЕРЕДОВИЩА ---
+# --- 2. WEBHOOK AND ENVIRONMENT VARIABLES ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
-WEB_SERVER_PORT = int(os.getenv("PORT", 8080)) 
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST") 
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook") 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") 
+WEB_SERVER_PORT = int(os.getenv("PORT", 8080))
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 WEBHOOK_URL = urljoin(WEBHOOK_HOST, WEBHOOK_PATH) if WEBHOOK_HOST else None
 try:
     ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 except ValueError:
     ADMIN_ID = 0
 
-# Глобальні змінні
+# Глобальні змінні для DB, Bot, Dispatcher
 db_pool: asyncpg.Pool = None
 dp: Dispatcher = None
 bot: Bot = None
+current_post_limit: int = 0
 
 
-# --- 2. БАЗА ДАНИХ (POSTGRESQL/NEON) ---
+# --- 3. DATABASE (POSTGRESQL/NEON) ---
 
 async def connect_db():
     """Створює пул з'єднань до PostgreSQL, оптимізований для Neon."""
@@ -109,14 +124,13 @@ async def connect_db():
     if not DATABASE_URL:
         logger.critical("Критична помилка: Не задано DATABASE_URL.")
         return
-        
     try:
         db_pool = await asyncpg.create_pool(
             DATABASE_URL,
-            min_size=Config.DB_POOL_MIN, 
+            min_size=Config.DB_POOL_MIN,
             max_size=Config.DB_POOL_MAX,
-            timeout=5,
-            statement_cache_size=0 
+            timeout=10,
+            statement_cache_size=0
         )
         logger.info(f"✅ Успішно підключено до Neon PostgreSQL. Пул: {Config.DB_POOL_MIN}-{Config.DB_POOL_MAX}.")
     except Exception as e:
@@ -124,11 +138,10 @@ async def connect_db():
         await asyncio.sleep(60)
         exit(1)
 
-async def init_db():
-    """Створює таблицю 'news' та необхідні індекси."""
-    if not db_pool:
-        return
 
+async def init_db():
+    """Створює таблиці 'news' та 'source_stats' для надійної роботи."""
+    if not db_pool: return
     async with db_pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS news (
@@ -140,664 +153,609 @@ async def init_db():
                 image_url TEXT,
                 published_at TIMESTAMP WITH TIME ZONE NOT NULL,
                 inserted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                is_posted BOOLEAN DEFAULT FALSE
+                is_posted BOOLEAN DEFAULT FALSE,
+                score SMALLINT DEFAULT 0
             );
         """)
-        
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS source_stats (
+                source_url TEXT PRIMARY KEY,
+                error_count INTEGER DEFAULT 0,
+                last_error_at TIMESTAMP WITH TIME ZONE,
+                is_blocked BOOLEAN DEFAULT FALSE
+            );
+        """)
         try:
-            await conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS news_url_idx ON news (url);
-                CREATE INDEX IF NOT EXISTS news_is_posted_idx ON news (is_posted, published_at);
-            """)
+            await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS news_url_idx ON news (url);")
+            await conn.execute("CREATE INDEX IF NOT EXISTS news_is_posted_idx ON news (is_posted, score DESC, published_at DESC);")
         except Exception as e:
             logger.error(f"Помилка при створенні індексу: {e}")
-
     logger.info("Таблиці DB перевірені/оновлені.")
 
-async def save_news_to_db(news_items: List[Dict[str, Any]]) -> int:
-    """Пакетна вставка нових новин (оптимізація Neon) в одній транзакції."""
+
+async def save_news_with_transaction(news_items: List[Dict[str, Any]]) -> int:
+    """Виконує пакетну вставку новин в одній транзакції з перевіркою на дублікати."""
     if not news_items or not db_pool:
         return 0
-    
+
+    # 1. Фільтрація дублікатів за схожістю заголовків
+    try:
+        async with db_pool.acquire() as conn:
+            recent_titles = await conn.fetch("SELECT title FROM news WHERE published_at > $1", datetime.now(KYIV_TZ) - timedelta(hours=2))
+            recent_titles_set = {r['title'] for r in recent_titles}
+
+        unique_news = []
+        for item in news_items:
+            is_duplicate = False
+            for existing_title in recent_titles_set:
+                if fuzz.ratio(item['title'], existing_title) > Config.DUPLICATE_TITLE_THRESHOLD:
+                    is_duplicate = True
+                    break
+            if not is_duplicate:
+                unique_news.append(item)
+                recent_titles_set.add(item['title'])
+    except Exception as e:
+        logger.error(f"Помилка перевірки на дублікати: {e}. Продовжуємо без неї.")
+        unique_news = news_items
+
+    if not unique_news:
+        logger.info("Всі знайдені новини відфільтровані як дублікати.")
+        return 0
+
+    # 2. Пакетна вставка унікальних новин
     sql = """
-        INSERT INTO news (source, url, title, summary, image_url, published_at)
-        SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[])
-        ON CONFLICT (url) DO NOTHING
-        RETURNING id;
+        INSERT INTO news (source, url, title, summary, image_url, published_at, score)
+        SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::smallint[])
+        ON CONFLICT (url) DO NOTHING;
     """
-    
-    sources = [item['source'] for item in news_items]
-    urls = [item['url'] for item in news_items]
-    titles = [item['title'] for item in news_items]
-    summaries = [item['summary'] for item in news_items]
-    image_urls = [item['image_url'] for item in news_items]
-    published_at_list = [item['published_at'] for item in news_items]
+    params = ([item[key] for item in unique_news] for key in ['source', 'url', 'title', 'summary', 'image_url', 'published_at', 'score'])
     
     try:
         async with db_pool.acquire() as conn:
-            async with conn.transaction():
-                result = await conn.fetch(sql, sources, urls, titles, summaries, image_urls, published_at_list)
-                return len(result)
+            result = await conn.execute(sql, *params)
+            inserted_count = int(result.split()[-1])
+            return inserted_count
     except asyncpg.exceptions.PostgresError as e:
         logger.error(f"❌ Помилка транзакційної вставки в БД: {e}")
         return 0
 
-async def get_unique_news_from_db(limit: int) -> List[Dict[str, Any]]:
-    """
-    Вибір новин з найвищим пріоритетом. 
-    Пріоритет (проксі "Кількість Переглядів"):
-    1. Наявність фото (обов'язково).
-    2. Свіжість (не старше MAX_AGE_MIN).
-    3. Сортування за published_at DESC (найсвіжіші — найвищий рейтинг).
-    """
-    if not db_pool or limit == 0:
-        return []
-    
-    max_age_interval = f"INTERVAL '{Config.MAX_AGE_MIN} minutes'"
 
-    sql = f"""
-        SELECT url, title, summary, image_url, source, published_at
+async def get_active_sources_from_db() -> Set[str]:
+    """Вибирає лише ті джерела, які не заблоковані або час блокування минув."""
+    if not db_pool: return set(Config.SOURCES)
+    
+    await update_source_block_status()
+    
+    sql_get_blocked = "SELECT source_url FROM source_stats WHERE is_blocked = TRUE;"
+    try:
+        async with db_pool.acquire() as conn:
+            blocked_records = await conn.fetch(sql_get_blocked)
+            blocked_urls = {r['source_url'] for r in blocked_records}
+            active_sources = set(Config.SOURCES) - blocked_urls
+
+            all_db_sources = {r['source_url'] for r in await conn.fetch("SELECT source_url FROM source_stats;")}
+            new_sources = set(Config.SOURCES) - all_db_sources
+            if new_sources:
+                 await conn.executemany("INSERT INTO source_stats (source_url) VALUES ($1) ON CONFLICT DO NOTHING;", [(url,) for url in new_sources])
+                 
+            logger.info(f"Активних джерел: {len(active_sources)}. Заблокованих: {len(blocked_urls)}")
+            return active_sources
+    except asyncpg.exceptions.PostgresError as e:
+        logger.error(f"❌ Помилка отримання активних джерел: {e}")
+        return set(Config.SOURCES)
+
+
+async def update_source_error_count(source_url: str, is_error: bool, http_code: int = None):
+    """Оновлює статистику джерела та блокує його при досягненні порога."""
+    if not db_pool: return
+    async with db_pool.acquire() as conn:
+        if is_error and http_code in Config.BLOCKED_HTTP_CODES:
+            await conn.execute("""
+                INSERT INTO source_stats (source_url, error_count, last_error_at) VALUES ($1, 1, $2)
+                ON CONFLICT (source_url) DO UPDATE SET error_count = source_stats.error_count + 1, last_error_at = $2;
+            """, source_url, datetime.now(KYIV_TZ))
+            record = await conn.fetchrow("SELECT error_count FROM source_stats WHERE source_url = $1;", source_url)
+            if record and record['error_count'] >= Config.SOURCE_BLOCK_THRESHOLD:
+                await conn.execute("UPDATE source_stats SET is_blocked = TRUE WHERE source_url = $1;", source_url)
+                logger.warning(f"🚨 Джерело заблоковано: {source_url}. Помилок: {record['error_count']}.")
+        elif not is_error:
+            await conn.execute("""
+                INSERT INTO source_stats (source_url, error_count, is_blocked) VALUES ($1, 0, FALSE)
+                ON CONFLICT (source_url) DO UPDATE SET error_count = 0, is_blocked = FALSE;
+            """, source_url)
+
+
+async def update_source_block_status():
+    """Розблоковує джерела, час блокування яких минув."""
+    if not db_pool: return
+    unlock_time = datetime.now(KYIV_TZ) - timedelta(hours=Config.SOURCE_BLOCK_DURATION_HOURS)
+    async with db_pool.acquire() as conn:
+        records = await conn.fetch("UPDATE source_stats SET is_blocked = FALSE, error_count = 0 WHERE is_blocked = TRUE AND last_error_at < $1 RETURNING source_url;", unlock_time)
+        if records: logger.info(f"🔓 Розблоковано {len(records)} джерел.")
+
+
+async def get_unique_news_from_db(limit: int) -> List[Dict[str, Any]]:
+    """Вибирає свіжі, неопубліковані новини з пріоритетом за рейтингом, наявністю фото та свіжістю."""
+    if not db_pool or limit == 0: return []
+    sql = """
+        SELECT source, url, title, summary, image_url, published_at
         FROM news
         WHERE is_posted = FALSE
-          AND published_at > (NOW() - {max_age_interval}) -- Фільтрація за свіжістю
-          AND image_url IS NOT NULL AND image_url != ''   -- Фільтрація за наявністю фото
         ORDER BY 
-            published_at DESC                               -- Свіжість (як проксі популярності/переглядів)
+            score DESC,                                          -- 1. Важливість новини
+            (CASE WHEN image_url IS NOT NULL THEN 0 ELSE 1 END), -- 2. Пріоритет фото
+            published_at DESC                                    -- 3. Свіжість
         LIMIT $1;
     """
-    
     try:
         async with db_pool.acquire() as conn:
-            records = await conn.fetch(sql, limit)
-            return [dict(record) for record in records]
-    except asyncpg.exceptions.PostgresError as e:
-        logger.error(f"❌ Помилка вибірки з БД: {e}")
+            return [dict(r) for r in await conn.fetch(sql, limit)]
+    except Exception as e:
+        logger.error(f"❌ Помилка отримання новин з БД: {e}")
         return []
 
+
 async def mark_news_as_posted(urls: List[str]):
-    """Пакетне оновлення статусу 'is_posted' (економія запитів)."""
-    if not urls or not db_pool:
-        return
-    sql = """
-        UPDATE news
-        SET is_posted = TRUE
-        WHERE url = ANY($1::text[]);
-    """
+    """Пакетне оновлення статусу 'is_posted'."""
+    if not urls or not db_pool: return
     try:
         async with db_pool.acquire() as conn:
-            await conn.execute(sql, urls)
-    except asyncpg.exceptions.PostgresError as e:
-        logger.error(f"❌ Помилка пакетного оновлення статусу в БД: {e}")
+            await conn.execute("UPDATE news SET is_posted = TRUE WHERE url = ANY($1::text[]);", urls)
+    except Exception as e:
+        logger.error(f"❌ Помилка пакетного оновлення статусу: {e}")
+
 
 async def cleanup_db():
-    """Видаляє старі записи з БД."""
-    if not db_pool:
-        return
-        
-    cleanup_time = datetime.now(KYIV_TZ) - timedelta(days=Config.DB_CLEANUP_DAYS)
-    
-    sql = """
-        DELETE FROM news
-        WHERE inserted_at < $1;
-    """
+    """Видаляє старі записи новин."""
+    if not db_pool: return
+    cutoff_time = datetime.now(KYIV_TZ) - timedelta(days=Config.DB_CLEANUP_DAYS)
     try:
         async with db_pool.acquire() as conn:
-            result = await conn.execute(sql, cleanup_time)
-            match = re.search(r'DELETE (\d+)', result)
-            count = int(match.group(1)) if match else 0
-            logger.info(f"🧹 Обслуговування DB: Видалено {count} старих записів.")
-            return count
-    except asyncpg.exceptions.PostgresError as e:
-        logger.error(f"❌ Помилка очистки БД: {e}")
-        return 0
+            result = await conn.execute("DELETE FROM news WHERE inserted_at < $1;", cutoff_time)
+            deleted_count = int(result.split()[-1])
+            if deleted_count > 0:
+                logger.info(f"🗑️ Видалено {deleted_count} старих записів новин (старше {Config.DB_CLEANUP_DAYS} днів).")
+    except Exception as e:
+        logger.error(f"❌ Помилка очищення БД: {e}")
 
-async def get_db_stats() -> Dict[str, Any]:
-    """Повертає статистику по записах у БД."""
-    if not db_pool:
-        return {}
-        
+
+async def get_db_stats() -> Dict[str, int]:
+    """Отримує загальну статистику для команд адміністратора."""
+    if not db_pool: return {}
     sql = """
         SELECT 
-            (SELECT count(*) FROM news) AS total_news,
-            (SELECT count(*) FROM news WHERE is_posted = TRUE) AS posted_news,
-            (SELECT count(*) FROM news WHERE is_posted = FALSE) AS unposted_news;
+            COUNT(*) AS total_news,
+            COUNT(*) FILTER (WHERE is_posted = TRUE) AS posted_news,
+            COUNT(*) FILTER (WHERE is_posted = FALSE) AS unposted_total,
+            COUNT(*) FILTER (WHERE is_posted = FALSE AND image_url IS NOT NULL) AS unposted_with_image
+        FROM news;
     """
     try:
         async with db_pool.acquire() as conn:
             record = await conn.fetchrow(sql)
             return dict(record) if record else {}
-    except asyncpg.exceptions.PostgresError as e:
-        logger.error(f"❌ Помилка отримання статистики з БД: {e}")
+    except Exception as e:
+        logger.error(f"❌ Помилка отримання статистики: {e}")
         return {}
 
 
-# --- 3. ХЕЛПЕРИ ПАРСИНГУ ---
+# --- 4. PARSING HELPERS AND CONTENT PROCESSING ---
 
-def is_news_relevant(title: str, summary: str) -> bool:
-    """Фільтрує новини за нерелевантними ключовими словами (Шоу-бізнес, Спорт)."""
-    if not title and not summary:
-        return False
-        
-    text = (title + " " + summary).lower()
+def calculate_news_score(title: str, summary: str) -> int:
+    """Оцінює новину за ключовими словами для пріоритезації."""
+    content = (title + ' ' + summary).lower()
+    score = 0
     
-    celebrity_keywords = [
-        "зірок", "шоу-бізнес", "світське життя", "особисте життя", 
-        "вагітність", "розлучення", "скандал", "мода", "гламур", "голлівуд"
-    ]
+    # Пріоритетні теми
+    priority_keywords = {
+        'зсу': 15, 'війна': 12, 'обстріл': 12, 'атака': 12, 'фронт': 12, 'ракета': 10, 'дрон': 10,
+        'президент': 10, 'зеленський': 10, 'кабмін': 8, 'рада': 8, 'сбу': 8, 'гур': 8,
+        'сша': 7, 'нато': 7, 'єс': 7, 'допомога': 7, 'санкції': 7,
+        'київ': 5, 'львів': 5, 'харків': 5, 'одеса': 5, 'дніпро': 5
+    }
+    # Негативні/спамні теми
+    negative_keywords = ['гороскоп', 'астрологічний', 'реклама', 'погода', 'рецепт', 'шоу-бізнес']
     
-    football_keywords = [
-        "футбол", "матч", "ліга чемпіонів", "ліга європи", "динамо", "шахтар",
-        "фк ", "борусія", "реал", "барселона"
-    ]
+    if any(kw in content for kw in negative_keywords):
+        return -1 # Сигнал для ігнорування новини
+    
+    for kw, value in priority_keywords.items():
+        if kw in content:
+            score += value
+    return score
 
-    for keyword in celebrity_keywords + football_keywords:
-        if keyword in text:
-            logger.debug(f"Пропущено новину (ФІЛЬТР): {title[:50]}...")
-            return False
-            
-    return True
-    
+
 def normalize_summary(text: str) -> str:
-    """Очищує HTML та обрізає текст опису."""
-    if not text:
-        return ""
+    """Очищення та скорочення тексту для використання в Telegram."""
+    if not text: return "Деталі за посиланням."
     soup = BeautifulSoup(text, 'html.parser')
-    clean_text = soup.get_text()
-    clean_text = ' '.join(clean_text.split())
-    # Обрізаємо до 800 символів
-    if len(clean_text) > 800:
-        clean_text = clean_text[:780]
-        # Шукаємо останній розділовий знак
-        last_break = max(clean_text.rfind('.'), clean_text.rfind('!'), clean_text.rfind('?'))
-        if last_break > 200:
-            clean_text = clean_text[:last_break + 1]
-        clean_text += "..."
-        
-    return clean_text.strip()
+    clean_text = re.sub(r'\s+', ' ', soup.get_text()).strip()
+    if len(clean_text) > 450:
+        clean_text = clean_text[:420]
+        last_sentence_end = max(clean_text.rfind('.'), clean_text.rfind('!'), clean_text.rfind('?'))
+        clean_text = clean_text[:last_sentence_end + 1] if last_sentence_end > 100 else clean_text + "..."
+    return clean_text
 
-def extract_image_url(entry: feedparser.FeedParserDict) -> str:
-    """Намагається знайти дійсний URL зображення у різних полях RSS-запису."""
-    image_url = ""
 
-    if 'media_content' in entry:
-        for media in entry.media_content:
-            if media.get('url') and ('image' in media.get('type', '') or 'image' in media.get('medium', '')):
-                image_url = media['url']
-                break
-    
-    if not image_url and 'media_thumbnail' in entry and entry.media_thumbnail:
-        if isinstance(entry.media_thumbnail, list) and entry.media_thumbnail:
-            image_url = entry.media_thumbnail[0].get('url', '')
-        elif isinstance(entry.media_thumbnail, dict):
-             image_url = entry.media_thumbnail.get('url', '')
-    
-    if not image_url and entry.get('summary'):
-        soup = BeautifulSoup(entry.summary, 'html.parser') 
-        img = soup.find('img')
-        if img and img.get('src'):
-            image_url = img['src']
-            
-    if image_url:
-        if not image_url.startswith(('http://', 'https://')):
-             return ""
-        # Видалення параметрів запиту та хешів
-        clean_url = image_url.split('?')[0].split('#')[0]
+def extract_image_url(entry: feedparser.FeedParserDict) -> str | None:
+    """Вилучення URL зображення з різних полів RSS-запису."""
+    targets = [
+        # Пріоритет на якісні зображення
+        ('media_content', lambda m: m.get('url') if m.get('medium') == 'image' else None),
+        ('enclosures', lambda enc: enc.get('href') if enc.get('type', '').startswith('image/') else None),
+        ('media_thumbnail', lambda thumb: thumb.get('url'))
+    ]
+    for key, extractor in targets:
+        if key in entry:
+            items = entry[key]
+            if isinstance(items, list):
+                for item in items:
+                    url = extractor(item)
+                    if url: return url
+            elif isinstance(items, dict):
+                url = extractor(items)
+                if url: return url
+    # Запасний варіант: парсинг HTML
+    html_content = entry.get('content', [{}])[0].get('value') or entry.get('summary')
+    if html_content:
+        img = BeautifulSoup(html_content, 'html.parser').find('img')
+        if img and img.get('src'): return img['src']
+    return None
 
-        # Перевірка на розширення файлу зображення
-        if re.search(r'\.(jpe?g|png|gif|webp|tiff|svg|ico|bmp|avif)\b', clean_url.lower()):
-            return image_url
-            
-    return ""
 
 def parse_published_time(entry: feedparser.FeedParserDict) -> datetime:
-    """Витягує час публікації та конвертує його в Київський час."""
-    published = entry.get('published_parsed') or entry.get('updated_parsed')
-    
-    if published:
+    """Парсинг часу публікації та конвертація в Kyiv Time Zone."""
+    if hasattr(entry, 'published_parsed') and entry.published_parsed:
         try:
-            published_utc = datetime(*published[:6], tzinfo=timezone.utc)
-            return published_utc.astimezone(KYIV_TZ)
-        except Exception:
+            return datetime(*entry.published_parsed[:6], tzinfo=timezone.utc).astimezone(KYIV_TZ)
+        except (ValueError, TypeError):
             pass
-            
     return datetime.now(KYIV_TZ)
 
 
-# --- 4. ГЕНЕРАЦІЯ ХЕШТЕГІВ ---
-
-def get_base_form(word: str) -> str:
-    """
-    Професійна нормалізація слів до базової форми (іменний відмінок) 
-    для коректних хештегів (наприклад: "Трампа" -> "Трамп").
-    """
-    word = word.lower().strip()
-    if not word: return ""
-    
-    # Пріоритетні заміни за запитом користувача
-    replacements = {
-        'києви': 'київ', 'києва': 'київ', 'києвом': 'київ', 'києві': 'київ',
-        'тернопильщини': 'тернопіль', 'тернопільської': 'тернопіль',
-        'москви': 'москва', 'москвою': 'москва', 'москві': 'москва',
-        'трампа': 'трамп', 'трампом': 'трамп',
-        'пентагону': 'пентагон', 'пентагоном': 'пентагон',
-        'сенату': 'сенат', 'сенатом': 'сенат',
-        'росії': 'росія', 'росією': 'росія',
-        'китаю': 'китай', 'китаєм': 'китай',
-        'валенсії': 'валенсія', 'валенсією': 'валенсія',
-        'американської': 'америка', 'української': 'україна',
-        'зсу': 'ЗСУ', 'гур': 'ГУР', 'сбу': 'СБУ', 'нато': 'НАТО', 'єс': 'ЄС', 'оон': 'ООН'
-    }
-    
-    return replacements.get(word, word)
+# --- 5. HASHTAG GENERATION (IMPROVED) ---
 
 def generate_hashtags(title: str, source: str) -> str:
-    """Генерує до 7 релевантних хештегів з нормалізацією та комбінуванням імен."""
+    """Генерує релевантні хештеги з нормалізацією слів."""
     
-    stop_words = set([
-        'на', 'в', 'у', 'з', 'до', 'про', 'від', 'для', 'це', 'що', 'як',
-        'та', 'але', 'і', 'по', 'за', 'під', 'над', 'коли', 'буде', 'було', 'є',
-        'він', 'вона', 'воно', 'вони', 'ми', 'ви', 'тисяч', 'мільйонів', 'може', 
-        'які', 'який', 'яка', 'щодо', 'зі', 'через', 'поки', 'подробиці', 'сказав',
-        'заявив', 'повідомив', 'головне', 'нові', 'рік', 'році', 'далі', 'були',
-        'була', 'був', 'були', 'будуть', 'всі', 'кожен', 'частина'
-    ])
+    stop_words = {'на', 'в', 'у', 'з', 'до', 'про', 'від', 'для', 'це', 'що', 'як', 'та', 'але', 'і', 'по', 'за', 'під', 'над', 'коли', 'буде', 'було', 'є', 'він', 'вона', 'вони'}
+    
+    # Карта для об'єднання багатослівних назв
+    multi_word_map = {
+        ('володимир', 'зеленський'): 'ВолодимирЗеленський', ('дмитро', 'кулеба'): 'ДмитроКулеба',
+        ('валерій', 'залужний'): 'ВалерійЗалужний', ('кирило', 'буданов'): 'КирилоБуданов',
+        ('олександр', 'сирський'): 'ОлександрСирський', ('джо', 'байден'): 'ДжоБайден',
+        ('дональд', 'трамп'): 'ДональдТрамп', ('сполучені', 'штати'): 'США', ('велика', 'британія'): 'ВеликаБританія'
+    }
     
     hashtags: Set[str] = set()
     
-    # 1. Формування хештегу джерела та загальних тегів
-    clean_source = source.split('.')[0].replace('-', '').replace('_', '').replace('babel', 'Babel')
-    source_tag = f"#{clean_source.capitalize()}"
-    hashtags.add("#Новини")
-    hashtags.add(source_tag)
-    
-    # 2. Очистка та токенізація заголовка
-    clean_title = re.sub(r'[^\w\s]', ' ', title)
-    words = clean_title.split()
-    
-    # 3. Вилучення та нормалізація ключових слів
-    normalized_words = []
-    
-    for word in words:
-        if len(word) > 2 and word.lower() not in stop_words:
-            base_word = get_base_form(word)
-            
-            # Якщо слово було з великої літери (імовірно, ім'я або географія/організація)
-            if word[0].isupper():
-                # Зберігаємо нормалізовану форму з великої літери
-                normalized_words.append(base_word.capitalize())
-            else:
-                normalized_words.append(base_word)
-            
-    # 4. Комбінування Імен та Прізвищ (наприклад: #Ім’яПрізвище)
-    combined_names = set()
-    
-    for i in range(len(normalized_words) - 1):
-        word1 = normalized_words[i]
-        word2 = normalized_words[i+1]
-        
-        # Перевіряємо, чи обидва слова нормалізовані та починаються з великої літери
-        if word1[0].isupper() and word2[0].isupper():
-            combined_names.add(f"#{word1}{word2}")
-            hashtags.add(f"#{word1}")
-            hashtags.add(f"#{word2}")
-    
-    # 5. Додавання решти ключових слів
-    for word in normalized_words:
-        # Додаємо всі нормалізовані слова, що починаються з великої літери
-        if word[0].isupper():
-            hashtags.add(f"#{word}")
-        # Додаємо важливі слова, навіть якщо вони були з малої літери
-        elif word.lower() in ['війна', 'економіка', 'політика', 'фронт', 'світ']:
-            hashtags.add(f"#{word.capitalize()}")
-    
-    # 6. Фіналізація та ліміт (до 7 тегів)
-    final_tags = list(hashtags)
-    # Сортуємо, щоб #Новини та джерело були першими
-    final_tags.sort(key=lambda tag: (
-        0 if tag == "#Новини" else
-        1 if tag == source_tag else
-        2 if tag.startswith('#') and tag[1:].isupper() else # Пріоритет абревіатурам
-        3 
-    ))
-    
-    # Додаємо комбіновані імена
-    for tag in combined_names:
-        if tag not in final_tags and len(final_tags) < 7:
-            final_tags.append(tag)
-            
-    # Обмеження до 7 тегів
-    return " ".join(final_tags[:7])
+    # 1. Хештег джерела
+    source_parts = urlparse(f"https://{source}").netloc.split('.')
+    clean_source = source_parts[-2] if len(source_parts) > 1 else source_parts[0]
+    hashtags.add(f"#{clean_source.capitalize()}")
 
-# --- 5. ОСНОВНИЙ ПАРСИНГ ---
+    # 2. Обробка заголовка
+    words = re.sub(r'[^\w\s-]', '', title).lower().split()
+    
+    i = 0
+    while i < len(words):
+        # Перевірка на багатослівні комбінації
+        found_multi = False
+        for (w1, w2), tag in multi_word_map.items():
+            if i + 1 < len(words) and words[i] == w1 and words[i+1] == w2:
+                hashtags.add(f"#{tag}")
+                i += 2
+                found_multi = True
+                break
+        if found_multi: continue
+
+        word = words[i]
+        if len(word) > 3 and word not in stop_words:
+            # Нормалізація (приведення до початкової форми)
+            p = morph.parse(word)[0]
+            normal_form = p.normal_form
+            if len(normal_form) > 2:
+                 # Додаємо хештег, якщо це іменник або значуще слово
+                if 'NOUN' in p.tag or (p.score > 0.5 and 'ADJF' not in p.tag and 'VERB' not in p.tag):
+                    hashtags.add(f"#{normal_form.capitalize()}")
+        i += 1
+
+    final_tags = ["#Новини"] + sorted(list(hashtags), key=len, reverse=True)
+    return " ".join(final_tags[:7]) # Обмеження на 7 хештегів
+
+
+# --- 6. CORE PARSING LOGIC ---
 
 async def fetch_and_parse_source(session: aiohttp.ClientSession, rss_url: str) -> List[Dict[str, Any]]:
-    """Отримує, парсить та фільтрує новини з одного RSS-джерела."""
+    """Отримує, парсить та фільтрує новини з одного RSS-джерела з повторними спробами."""
     news_items = []
     source_domain = urlparse(rss_url).netloc.replace('www.', '')
     
-    try:
-        async with session.get(rss_url, headers=Config.DEFAULT_HEADERS, timeout=Config.HTTP_TIMEOUT) as response:
-            if response.status != 200:
-                logger.warning(f"⚠️ HTTP Помилка {response.status} при отриманні RSS для {rss_url}")
-                return []
-            
-            content = await response.text(encoding=response.charset or 'utf-8')
-    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
-        logger.error(f"❌ Помилка мережі/таймауту для {rss_url}: {type(e).__name__} - {e}")
-        return []
-
-    feed = feedparser.parse(content)
-    now_kyiv = datetime.now(KYIV_TZ)
-    max_age_dt = timedelta(minutes=Config.MAX_AGE_MIN) 
-
-    for entry in feed.entries[:Config.FETCH_LIMIT]:
+    for attempt in range(Config.MAX_RETRIES):
         try:
-            url = entry.link
-            title = entry.title
-            summary = normalize_summary(entry.get('summary') or entry.get('description') or entry.title)
+            async with session.get(rss_url, headers=Config.DEFAULT_HEADERS, timeout=Config.HTTP_TIMEOUT) as response:
+                if response.status == 200:
+                    await update_source_error_count(rss_url, is_error=False)
+                    content = await response.text()
+                    feed = feedparser.parse(content)
+                    
+                    now_kyiv = datetime.now(KYIV_TZ)
+                    max_age_dt = timedelta(minutes=Config.MAX_AGE_MIN)
+
+                    for entry in feed.entries[:Config.FETCH_LIMIT]:
+                        published_time = parse_published_time(entry)
+                        if now_kyiv - published_time > max_age_dt: continue
+
+                        title = entry.title.strip()
+                        summary = normalize_summary(entry.get('summary') or entry.get('description') or title)
+                        score = calculate_news_score(title, summary)
+                        
+                        # PRE-POSTING VALIDATION
+                        if score < 0 or len(title) < Config.MIN_TITLE_LENGTH: continue
+                        
+                        news_items.append({
+                            'source': source_domain, 'title': title, 'url': entry.link,
+                            'summary': summary, 'image_url': extract_image_url(entry),
+                            'published_at': published_time, 'score': score
+                        })
+                    return news_items
+                
+                elif response.status in Config.BLOCKED_HTTP_CODES:
+                    logger.warning(f"⚠️ HTTP Помилка {response.status} для {rss_url}. Блокую...")
+                    await update_source_error_count(rss_url, is_error=True, http_code=response.status)
+                    return []
+                else:
+                    logger.warning(f"⚠️ HTTP Помилка {response.status} ({attempt+1}/{Config.MAX_RETRIES}) для {rss_url}.")
+                    
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(f"❌ Помилка мережі ({attempt+1}/{Config.MAX_RETRIES}) для {rss_url}: {type(e).__name__}.")
+        
+        if attempt < Config.MAX_RETRIES - 1:
+            await asyncio.sleep(Config.RETRY_DELAY_SEC * (2 ** attempt))
             
-            if not is_news_relevant(title, summary):
-                continue
+    await update_source_error_count(rss_url, is_error=True, http_code=599) # 599 - Network Connect Timeout Error
+    return []
 
-            image_url = extract_image_url(entry)
-            published_time = parse_published_time(entry)
-
-            # Фільтр за віком (вже відбувається в БД, але тут для запобігання зайвої DB-вставки)
-            if now_kyiv - published_time > max_age_dt:
-                continue
-
-            news_items.append({
-                'source': source_domain, 'title': title, 'url': url, 
-                'summary': summary, 'image_url': image_url, 'published_at': published_time,
-            })
-        except Exception as e:
-            logger.warning(f"Помилка обробки запису з {rss_url}: {e}")
-            continue
-
-    return news_items
 
 async def fetch_all_sources() -> Tuple[List[Dict[str, Any]], float]:
-    """Запускає одночасний парсинг вибраних випадкових джерел."""
-    all_news = []
+    """Запускає одночасний парсинг активних джерел."""
     start_time = datetime.now()
-
-    num_sources_to_fetch = min(Config.NUM_SOURCES_TO_FETCH, len(Config.SOURCES)) 
-    selected_sources = random.sample(Config.SOURCES, num_sources_to_fetch)
+    active_sources_urls = await get_active_sources_from_db()
     
-    logger.info(f"⏳ Парсинг {len(selected_sources)} випадкових джерел...")
+    num_to_fetch = min(Config.NUM_SOURCES_TO_FETCH, len(active_sources_urls))
+    selected_sources = random.sample(list(active_sources_urls), num_to_fetch)
+    logger.info(f"⏳ Парсинг {len(selected_sources)} випадкових активних джерел...")
 
-    connector = aiohttp.TCPConnector(limit=Config.MAX_CONCURRENCY)
-    async with aiohttp.ClientSession(headers=Config.DEFAULT_HEADERS, connector=connector) as session:
-        tasks = [fetch_and_parse_source(session, rss_url) for rss_url in selected_sources]
-        results = await asyncio.gather(*tasks)
+    connector = aiohttp.TCPConnector(limit_per_host=5, limit=Config.MAX_CONCURRENCY, ssl=False)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        tasks = [fetch_and_parse_source(session, url) for url in selected_sources]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        for news_list in results:
-            if news_list:
-                all_news.extend(news_list)
-
+    all_news = [item for res in results if isinstance(res, list) for item in res]
     duration = (datetime.now() - start_time).total_seconds()
-    
     return all_news, duration
 
-# --- 6. ФОРМАТУВАННЯ ТА ПОСТИНГ ---
+
+# --- 7. FORMATTING AND POSTING ---
 
 def format_news_post(news_item: Dict[str, Any]) -> str:
-    """Форматує новину для відправки в Telegram, включаючи хештеги."""
-    source_display = news_item['source'].replace('https://', '').replace('http://', '')
-    published_time_str = news_item['published_at'].strftime(TIME_FORMAT)
+    """Форматує новину для Telegram, включаючи якісні хештеги."""
+    source_display = news_item['source']
+    hashtags = generate_hashtags(news_item['title'], source_display)
     
-    # Основний текст
-    message = (
+    return (
         f"<b>⚡️ {news_item['title']}</b>\n\n"
         f"{news_item['summary']}\n\n"
-        f"🕰️ {published_time_str} | <a href='{news_item['url']}'>Подробиці на {source_display}</a>"
+        f"<a href='{news_item['url']}'>Подробиці на {source_display}</a>"
+        f"\n\n{hashtags}"
     )
 
-    # Генерація та додавання хештегів
-    hashtags = generate_hashtags(news_item['title'], source_display)
-    message += f"\n\n{hashtags}" 
-    
-    return message
 
 async def send_news_to_channel(news_to_post: List[Dict[str, Any]]) -> int:
-    """Надсилає новини в Telegram-канал з перевіркою валідності контенту."""
+    """Надсилає новини в Telegram-канал з безпечним оновленням статусу DB."""
     posted_urls = []
-    
     for news in news_to_post:
-        
-        # Перевірка на валідність контенту перед постом
-        if not news.get('title') or not news.get('url') or not news.get('summary') or not news.get('image_url'):
-            logger.warning(f"Пропущено новину (неповні дані): {news.get('title', 'N/A')}")
-            # Не позначаємо як опубліковану, можливо, дані з'являться пізніше
-            continue
-            
         try:
             caption = format_news_post(news)
+            if news.get('image_url'):
+                await bot.send_photo(CHANNEL_ID, photo=news['image_url'], caption=caption)
+            else:
+                await bot.send_message(CHANNEL_ID, text=caption, disable_web_page_preview=True)
             
-            # Публікація з фото (image_url перевірено)
-            await bot.send_photo(
-                chat_id=CHANNEL_ID,
-                photo=news['image_url'],
-                caption=caption,
-                parse_mode=ParseMode.HTML,
-                disable_notification=False 
-            )
-            
-            await asyncio.sleep(1.5) # Пауза, щоб уникнути FloodWait
             posted_urls.append(news['url'])
+            await asyncio.sleep(1.5) # Пауза для уникнення FloodWait
             
         except TelegramAPIError as e:
             logger.error(f"❌ Telegram API Error для '{news['title'][:50]}...': {e.message}")
-            
-            # Позначаємо як опубліковану, якщо проблема з фото (щоб не повторювати спроби)
-            if "Bad Request" in e.message:
-                logger.warning("-> Проблема з фото або форматуванням. Новина буде пропущена.")
-                posted_urls.append(news['url']) 
-                
+            if "failed to get HTTP URL content" in e.message or "PHOTO_INVALID" in e.message:
+                logger.warning("-> Проблема з URL зображення. Позначаємо як опубліковану, щоб не повторювати помилку.")
+                posted_urls.append(news['url']) # Позначаємо, щоб уникнути циклічної помилки
             continue
         except Exception as e:
             logger.error(f"❌ Невідома помилка відправки для '{news['title'][:50]}...': {e}")
-            continue 
+            continue
 
-    # Пакетне оновлення статусу
-    await mark_news_as_posted(posted_urls)
+    if posted_urls:
+        await mark_news_as_posted(posted_urls)
     return len(posted_urls)
 
-# --- 7. ЦИКЛИ ТА КОМАНДИ АДМІНІСТРАТОРА ---
 
-async def db_cleanup_loop():
-    """Асинхронний цикл для періодичного очищення бази даних."""
+# --- 8. LOOPS AND ADMIN COMMANDS ---
+
+async def db_maintenance_loop():
+    """Асинхронний цикл для періодичного очищення БД та оновлення джерел."""
     while True:
-        await asyncio.sleep(Config.CLEANUP_INTERVAL_HOURS * 3600) 
-        logger.info("--- ♻️ Запуск фонової очистки БД ---")
+        await asyncio.sleep(Config.CLEANUP_INTERVAL_HOURS * 3600)
+        logger.info("--- ♻️ Запуск фонового обслуговування БД ---")
         await cleanup_db()
+        await update_source_block_status()
 
-async def auto_posting_loop(bot_instance: Bot):
+
+async def auto_posting_loop():
     """Головний цикл, який періодично перевіряє та публікує новини."""
+    global current_post_limit
+    wait_time = Config.POSTING_INTERVAL_MIN * 60
+    current_post_limit = 0 # Починаємо з 0 для поступового "розігріву"
+    
     while True:
-        wait_time = Config.POSTING_INTERVAL_MIN * 60
         try:
             logger.info("--- 🚀 Запуск циклу автопостингу ---")
             
-            # 1. Парсинг і збереження новин (Транзакційно)
             fetched_news, parse_duration = await fetch_all_sources()
-            new_count = await save_news_to_db(fetched_news)
-            logger.info(f"💾 Успішно вставлено {new_count} новин.")
-
-            # 2. Отримуємо новини для публікації (з лімітом та пріоритетом)
-            news_to_post = await get_unique_news_from_db(Config.MAX_NEWS_PER_CYCLE)
+            new_count = await save_news_with_transaction(fetched_news)
             
-            # 3. Публікація 
+            # Динамічний ліміт: 1 -> 2 -> 3. Це "розігрів" після запуску.
+            current_post_limit = min(current_post_limit + 1, Config.MAX_NEWS_PER_CYCLE)
+            
+            news_to_post = await get_unique_news_from_db(current_post_limit)
+            
             post_start_time = datetime.now()
             posted_count = await send_news_to_channel(news_to_post)
             post_duration = (datetime.now() - post_start_time).total_seconds()
             
             logger.info(
-                f"--- ✅ Цикл завершено. Нових: {new_count}. Постів: {posted_count}. Таймінги: Парсинг={parse_duration:.2f}с, Постинг={post_duration:.2f}с ---"
+                f"--- ✅ Цикл завершено. Нових: {new_count}. Ліміт: {current_post_limit}. Опубліковано: {posted_count}. "
+                f"Таймінги: Парсинг={parse_duration:.2f}с, Постинг={post_duration:.2f}с ---"
             )
             
         except Exception as e:
             logger.critical(f"❌ Критична помилка в циклі автопостингу: {e}", exc_info=True)
 
         await asyncio.sleep(wait_time)
-        logger.info(f"Очікування {Config.POSTING_INTERVAL_MIN} хвилин...")
 
 
-# --- КОМАНДИ АДМІНІСТРАТОРА ---
+# --- ADMIN COMMANDS ---
 
 async def cmd_status(message: types.Message):
     """Показує поточний статус бота та конфігурацію."""
-    config_msg = (
-        "<b>🤖 Статус Платформи Новин:</b>\n\n"
-        "<b>⚙️ Конфігурація:</b>\n"
-        f"  🌐 Режим: <b>WEBHOOK</b>\n"
-        f"  ⏳ Інтервал: <b>{Config.POSTING_INTERVAL_MIN} хв</b>\n"
-        f"  📝 Макс. постів за цикл: <b>{Config.MAX_NEWS_PER_CYCLE}</b>\n"
-        f"  ⏱️ Макс. вік новини: {Config.MAX_AGE_MIN} хв\n"
-        f"  📸 Вимога: Тільки пости <b>З ФОТО</b> (пріоритет)\n"
-        f"  🔥 **Проксі Популярності:** Свіжість (published_at DESC)\n"
-        f"  📰 Джерел у списку: {len(Config.SOURCES)}\n\n"
-        "<b>🔑 Сервісні параметри:</b>\n"
-        f"  Керування: <code>/forcepost</code>, <code>/stats</code>\n"
+    stats = await get_db_stats()
+    active_sources = await get_active_sources_from_db()
+    status_msg = (
+        f"<b>🤖 Статус Платформи Новин</b>\n\n"
+        f"<b>⚙️ Конфігурація:</b>\n"
+        f"  - Інтервал: <b>{Config.POSTING_INTERVAL_MIN} хв</b>\n"
+        f"  - Макс. вік новини: {Config.MAX_AGE_MIN} хв\n"
+        f"  - Макс. постів за цикл: <b>{Config.MAX_NEWS_PER_CYCLE}</b> (поточний: <b>{current_post_limit}</b>)\n"
+        f"  - Джерел: <b>{len(active_sources)}</b> активних / {len(Config.SOURCES)} всього\n\n"
+        f"📊 <b>Статистика DB:</b>\n"
+        f"  - Всього новин: {stats.get('total_news', 0)}\n"
+        f"  - Опубліковано: {stats.get('posted_news', 0)}\n"
+        f"  - У черзі: {stats.get('unposted_total', 0)} (з фото: {stats.get('unposted_with_image', 0)})"
     )
-    await message.answer(config_msg, parse_mode=ParseMode.HTML)
+    await message.answer(status_msg)
+
 
 async def cmd_forcepost(message: types.Message):
-    """Примусово запускає цикл парсингу та постингу."""
-    await message.answer("♻️ Примусовий запуск циклу парсингу...")
+    """Примусово запускає один повний цикл парсингу та постингу."""
+    await message.answer("⏳ Примусовий запуск циклу... Це може зайняти до хвилини.")
     
-    async def run_once(bot_instance):
-        try:
-            start_time = datetime.now()
-            fetched_news, parse_duration = await fetch_all_sources()
-            new_count = await save_news_to_db(fetched_news)
-            
-            news_to_post = await get_unique_news_from_db(Config.MAX_NEWS_PER_CYCLE) 
-            
-            post_start_time = datetime.now()
-            posted_count = await send_news_to_channel(news_to_post)
-            post_duration = (datetime.now() - post_start_time).total_seconds()
-            
-            result_msg = (
-                "✅ <b>Цикл примусового постингу завершено!</b>\n"
-                f"   • Знайдено нових новин: {new_count}\n"
-                f"   • Опубліковано новин: {posted_count}\n"
-                f"   • Таймінг (Парсинг): {parse_duration:.2f} сек\n"
-                f"   • Таймінг (Постинг): {post_duration:.2f} сек"
-            )
-        except Exception as e:
-            result_msg = f"❌ <b>Критична помилка примусового постингу:</b> {e}"
+    try:
+        fetched_news, p_dur = await fetch_all_sources()
+        new_count = await save_news_with_transaction(fetched_news)
+        limit = Config.MAX_NEWS_PER_CYCLE # Примусовий пост завжди з максимальним лімітом
+        news_to_post = await get_unique_news_from_db(limit)
+        posted_count = await send_news_to_channel(news_to_post)
         
-        await bot_instance.send_message(message.chat.id, result_msg, parse_mode=ParseMode.HTML)
-
-    loop = asyncio.get_event_loop()
-    loop.create_task(run_once(bot))
-
-
-async def cmd_stats(message: types.Message):
-    """Показує статистику бази даних."""
-    stats = await get_db_stats()
-    
-    if stats:
-        stats_msg = (
-            "📊 <b>Статистика Бази Даних:</b>\n\n"
-            f"• 📝 Всього новин у DB: {stats.get('total_news', 0)}\n"
-            f"• ✅ Опубліковано: {stats.get('posted_news', 0)}\n"
-            f"• 📦 У черзі (З ФОТО): {stats.get('unposted_news', 0)}\n"
-            f"• 📰 Активних джерел: {len(Config.SOURCES)}"
+        result_msg = (
+            f"✅ <b>Цикл примусового постингу завершено!</b>\n"
+            f"  - Знайдено нових новин: <b>{new_count}</b>\n"
+            f"  - Опубліковано новин: <b>{posted_count}</b> (ліміт: {limit})\n"
+            f"  - Час парсингу: {p_dur:.2f} сек"
         )
-    else:
-        stats_msg = "❌ Не вдалося отримати статистику з бази даних."
-
-    await message.answer(stats_msg, parse_mode=ParseMode.HTML)
-
-
-# --- 8. ЗАПУСК БОТА (WEBHOOK) ---
-
-async def main():
-    """Основна функція для ініціалізації та запуску бота через Webhook."""
+    except Exception as e:
+        logger.error(f"Помилка примусового постингу: {e}", exc_info=True)
+        result_msg = f"❌ <b>Критична помилка примусового постингу:</b> {e}"
     
-    if not all([BOT_TOKEN, DATABASE_URL, CHANNEL_ID, WEBHOOK_HOST, WEBHOOK_SECRET, ADMIN_ID]):
-        logger.critical("Критична помилка: Не задані BOT_TOKEN, DATABASE_URL, CHANNEL_ID, WEBHOOK_HOST, WEBHOOK_SECRET або ADMIN_ID.")
-        return
+    await message.answer(result_msg)
 
-    await connect_db()
+
+async def cmd_blocked(message: types.Message):
+    """Показує список заблокованих джерел."""
     if not db_pool:
+        await message.answer("❌ База даних недоступна.")
         return
+    
+    async with db_pool.acquire() as conn:
+        records = await conn.fetch("SELECT source_url, last_error_at FROM source_stats WHERE is_blocked = TRUE ORDER BY last_error_at DESC;")
+    
+    if not records:
+        await message.answer("✅ Всі джерела активні. Заблокованих немає.")
+        return
+        
+    response_lines = ["<b>🚨 Список заблокованих джерел:</b>"]
+    for r in records:
+        time_ago = datetime.now(KYIV_TZ) - r['last_error_at']
+        hours_ago = time_ago.total_seconds() / 3600
+        response_lines.append(f"  - <code>{r['source_url']}</code>\n    (остання помилка: {hours_ago:.1f} год тому)")
+        
+    await message.answer("\n".join(response_lines))
 
+
+# --- 9. BOT LAUNCH ---
+
+async def on_startup(bot_instance: Bot):
+    """Дії при старті: підключення до БД, ініціалізація, встановлення вебхука."""
+    await connect_db()
+    if not db_pool: return
     await init_db()
 
-    global bot
-    bot = Bot(
-        token=BOT_TOKEN, 
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+    await bot_instance.set_webhook(
+        url=WEBHOOK_URL,
+        secret_token=WEBHOOK_SECRET,
+        drop_pending_updates=True
     )
+    logger.info(f"✅ Webhook встановлено на: {WEBHOOK_URL}")
     
-    global dp
-    dp = Dispatcher()
-    
-    # Реєстрація команд (Тільки для ADMIN_ID)
-    dp.message.register(cmd_status, Command("status"), F.from_user.id == ADMIN_ID)
-    dp.message.register(cmd_forcepost, Command("forcepost"), F.from_user.id == ADMIN_ID)
-    dp.message.register(cmd_stats, Command("stats"), F.from_user.id == ADMIN_ID)
-
-    # Запускаємо фонові цикли
+    # Запуск фонових циклів
     loop = asyncio.get_event_loop()
-    loop.create_task(auto_posting_loop(bot))
-    loop.create_task(db_cleanup_loop())
-    logger.info("Бот запущено. Початок роботи (WEBHOOK MODE).")
+    loop.create_task(auto_posting_loop())
+    loop.create_task(db_maintenance_loop())
+    logger.info("🚀 Бот запущено. Початок роботи (WEBHOOK MODE).")
+
+
+async def on_shutdown(bot_instance: Bot):
+    """Дії при зупинці: закриття з'єднань."""
+    logger.info("Бот зупиняється...")
+    if bot_instance:
+        await bot_instance.delete_webhook(drop_pending_updates=True)
+        await bot_instance.session.close()
+        logger.info("Webhook успішно вимкнено.")
+    if db_pool:
+        await db_pool.close()
+        logger.info("Пул з'єднань до БД закрито.")
+
+
+def main():
+    """Основна функція для ініціалізації та запуску бота через Webhook."""
+    if not all([BOT_TOKEN, DATABASE_URL, CHANNEL_ID, WEBHOOK_HOST, WEBHOOK_SECRET, ADMIN_ID]):
+        logger.critical("Критична помилка: Не задані всі необхідні змінні середовища.")
+        return
+
+    global bot, dp
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+
+    # Реєстрація хуків життєвого циклу
+    dp.startup.register(on_startup)
+    dp.shutdown.register(on_shutdown)
     
-    runner = None
-    try:
-        # 1. Встановлюємо Webhook на сервері Telegram
-        await bot.set_webhook(
-            url=WEBHOOK_URL,
-            secret_token=WEBHOOK_SECRET,
-            drop_pending_updates=True 
-        )
-        logger.info(f"✅ Webhook встановлено на: {WEBHOOK_URL}")
+    # Реєстрація команд адміністратора
+    admin_filter = F.from_user.id == ADMIN_ID
+    dp.message.register(cmd_status, Command("status"), admin_filter)
+    dp.message.register(cmd_forcepost, Command("forcepost"), admin_filter)
+    dp.message.register(cmd_blocked, Command("blocked"), admin_filter)
 
-        # 2. Налаштовуємо AIOHTTP веб-сервер
-        app = web.Application()
-        
-        # Реєструємо обробник для шляху вебхука
-        webhook_request_handler = SimpleRequestHandler(
-            dispatcher=dp,
-            bot=bot,
-            secret_token=WEBHOOK_SECRET,
-        )
-        webhook_request_handler.register(app, WEBHOOK_PATH)
-
-        # 3. Запускаємо веб-сервер
-        runner = web.AppRunner(app)
-        await runner.setup()
-        site = web.TCPSite(runner, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
-        
-        await site.start()
-        logger.info(f"🌐 Веб-сервер запущено на {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
-        
-        # Блокуємо головний потік
-        await asyncio.Future() 
-
-    except Exception as e:
-        logger.critical(f"❌ Критична помилка у головній функції: {e}", exc_info=True)
-
-    finally:
-        # 4. Очищення
-        if bot:
-            await bot.delete_webhook(drop_pending_updates=True) 
-            await bot.session.close()
-            logger.info("Webhook успішно вимкнено.")
-        if db_pool:
-            await db_pool.close()
-        if runner:
-            await runner.cleanup()
+    # Налаштування та запуск веб-сервера aiohttp
+    app = web.Application()
+    SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(app, path=WEBHOOK_PATH)
+    web.run_app(app, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Бот зупинено вручну (KeyboardInterrupt).")
+        main()
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Бот зупинено.")
     except Exception as e:
-        logger.critical(f"❌ Головна помилка виконання: {e}")
+        logger.critical(f"❌ Головна помилка виконання: {e}", exc_info=True)
