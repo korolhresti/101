@@ -1,10 +1,6 @@
 aiogram==3.13.1
-asyncpg==0.29.0
+asyncpg
 aiohttp==3.9.5
 feedparser==6.0.11
 beautifulsoup4==4.12.3
-python-dotenv==1.0.1
-Pillow==10.4.0
-# --- Для аналізу тексту ---
-pymorphy3>=1.2
-thefuzz==0.22.1
+Cython
