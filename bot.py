@@ -35,9 +35,9 @@ class Config:
     """Конфігурація платформи, зібрана в одному місці."""
     
     # ⚙️ ОСНОВНІ ПАРАМЕТРИ ЦИКЛУ
-    # ЗМЕНШЕННЯ НАВАНТАЖЕННЯ НА DB: ЗМІНЕНО З 5 ХВ НА 10 ХВ
-    POSTING_INTERVAL_MIN = 10  # Кожні 10 хвилин
-    MAX_NEWS_PER_CYCLE = 3     # СТРОГИЙ ЛІМІТ: До 3 новин за цикл (ТОП-3)
+    # ЗМЕНЕНО: НАЗАД НА 5 ХВ за вимогою (зверніть увагу, це збільшує Compute Time DB)
+    POSTING_INTERVAL_MIN = 5   # Кожні 5 хвилин
+    MAX_NEWS_PER_CYCLE = 3     # СТРОГИЙ ЛІМІТ: До 3 новин за цикл
     MAX_AGE_MIN = 30           # Не публікувати новини старше 30 хвилин
     
     # 🛡️ ПАРАМЕТРИ НАДІЙНОСТІ ТА ПРОДУКТИВНОСТІ
@@ -56,7 +56,7 @@ class Config:
         'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8,en;q=0.7',
     }
     
-    # 1. 📰 Джерела новин (доповнений список)
+    # 1. 📰 Джерела новин
     SOURCES: List[str] = [
         "https://tsn.ua/rss/all.xml", "https://www.pravda.com.ua/rss/news/", 
         "https://censor.net/rss/all_news", "https://www.rbc.ua/static/rss/all.xml",
@@ -80,15 +80,15 @@ logger = logging.getLogger(__name__)
 
 # --- WEBHOOK І СЕРВІСНІ ЗМІННІ СЕРЕДОВИЩА ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL") # ЗАЛИШАЄМО, БО БЕЗ DB НЕМОЖЛИВО ЗБЕРЕГТИ СТАН
+DATABASE_URL = os.getenv("DATABASE_URL")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
 # Webhook конфігурація
 WEB_SERVER_HOST = os.getenv("WEB_SERVER_HOST", "0.0.0.0")
 WEB_SERVER_PORT = int(os.getenv("PORT", 8080)) 
-WEBHOOK_HOST = os.getenv("WEBHOOK_HOST") # Наприклад: https://my-bot.render.com
+WEBHOOK_HOST = os.getenv("WEBHOOK_HOST")
 WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook") 
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET") # Секретний токен
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 WEBHOOK_URL = urljoin(WEBHOOK_HOST, WEBHOOK_PATH) if WEBHOOK_HOST else None
 
@@ -102,11 +102,13 @@ db_pool: asyncpg.Pool = None
 dp: Dispatcher = None
 bot: Bot = None
 
+# ГЛОБАЛЬНА ЗМІННА: Динамічний ліміт постів (поступове збільшення 1, 2, 3...)
+# Ініціалізація змінної, яка буде зберігати стан між циклами
+current_post_limit: int = 0
+
+
 # --- 2. БАЗА ДАНИХ (POSTGRESQL/NEON) ---
-# Функції DB залишаються, оскільки вони необхідні для:
-# 1. Запобігання дублюванню новин (UNIQUE NOT NULL url)
-# 2. Збереження стану "опубліковано/не опубліковано" (is_posted)
-# 3. Черги новин між циклами (WHERE is_posted = FALSE)
+# ... (Функції DB залишаються без змін, оскільки вони оптимізовані для пакетної роботи)
 
 async def connect_db():
     """Створює пул з'єднань до PostgreSQL."""
@@ -119,7 +121,7 @@ async def connect_db():
         db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=1, 
-            max_size=5, # Зменшення максимального розміру пулу
+            max_size=5, # Зменшення максимального розміру пулу для економії Neon
             timeout=5 
         )
         logger.info("✅ Успішно підключено до Neon PostgreSQL.")
@@ -148,7 +150,7 @@ async def init_db():
             );
         """)
         
-        # Перевірка та створення індексу (для уникнення конфліктів)
+        # Використання індексів для швидкої вибірки (WHERE is_posted = FALSE)
         try:
             await conn.execute("""
                 CREATE UNIQUE INDEX IF NOT EXISTS news_url_idx ON news (url);
@@ -161,11 +163,10 @@ async def init_db():
 
 
 async def save_news_to_db(news_items: List[Dict[str, Any]]) -> int:
-    """Пакетна вставка нових новин, ігноруючи дублікати за url."""
+    """Пакетна вставка нових новин (економія Neon: 1 запит замість N)."""
     if not news_items or not db_pool:
         return 0
     
-    # Використовуємо UNNEST для пакетної вставки, що є більш ефективним (менше операцій на DB)
     sql = """
         INSERT INTO news (source, url, title, summary, image_url, published_at)
         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[])
@@ -189,11 +190,10 @@ async def save_news_to_db(news_items: List[Dict[str, Any]]) -> int:
         return 0
 
 async def get_unique_news_from_db(limit: int) -> List[Dict[str, Any]]:
-    """Отримує найновіші неопубліковані новини з фото."""
-    if not db_pool:
+    """Отримує найновіші неопубліковані новини з фото (ліміт встановлюється динамічно)."""
+    if not db_pool or limit == 0:
         return []
 
-    # Забезпечуємо, що ми беремо лише ті новини, які відповідають критеріям (новіші 30 хв)
     max_age_dt = datetime.now(KYIV_TZ) - timedelta(minutes=Config.MAX_AGE_MIN)
     
     sql = """
@@ -201,7 +201,7 @@ async def get_unique_news_from_db(limit: int) -> List[Dict[str, Any]]:
         FROM news
         WHERE is_posted = FALSE
           AND image_url IS NOT NULL AND image_url != '' 
-          AND published_at >= $2 -- Додаємо фільтр за віком на рівні DB
+          AND published_at >= $2
         ORDER BY 
             published_at DESC 
         LIMIT $1;
@@ -215,7 +215,7 @@ async def get_unique_news_from_db(limit: int) -> List[Dict[str, Any]]:
         return []
 
 async def mark_news_as_posted(urls: List[str]):
-    """Позначає список новин як опубліковані."""
+    """Позначає список новин як опубліковані (економія Neon: 1 запит замість N)."""
     if not urls or not db_pool:
         return
     sql = """
@@ -253,7 +253,6 @@ async def cleanup_db():
 
 async def get_db_stats() -> Dict[str, Any]:
     """Повертає статистику по записах у БД."""
-    # Функція залишається для адмін-команди /stats
     if not db_pool:
         return {}
         
@@ -273,7 +272,7 @@ async def get_db_stats() -> Dict[str, Any]:
         return {}
 
 # --- 3. ХЕЛПЕРИ ПАРСИНГУ ---
-# (Без змін, оскільки вони коректні)
+# ... (Без змін)
 
 def is_news_relevant(title: str, summary: str) -> bool:
     """Фільтрує новини за нерелевантними ключовими словами (Шоу-бізнес, Спорт)."""
@@ -364,10 +363,10 @@ def parse_published_time(entry: feedparser.FeedParserDict) -> datetime:
     # Якщо час не знайдено, використовуємо поточний час
     return datetime.now(KYIV_TZ)
 
-# --- 4. ГЕНЕРАЦІЯ ХЕШТЕГІВ (ОНОВЛЕНО) ---
+# --- 4. ГЕНЕРАЦІЯ ХЕШТЕГІВ (Взято з попередньої, покращеної версії) ---
 
 def generate_hashtags(title: str, source: str) -> str:
-    """Генерує хештеги відповідно до нових вимог: #Новини, #Source, #People, #Location, #Organization."""
+    """Генерує хештеги відповідно до вимог: #Новини, #Source, #People, #Location, #Organization."""
     
     # Базові стоп-слова
     stop_words = set([
@@ -389,7 +388,9 @@ def generate_hashtags(title: str, source: str) -> str:
     
     # 1. Формування хештегу джерела
     # Очищаємо домен (напр., www.pravda.com.ua -> Pravda)
-    clean_source = source.split('.')[0].replace('www', '').replace('-', '').replace('_', '').strip()
+    source_parts = urlparse(f"https://{source}").netloc.split('.')
+    clean_source = source_parts[-2] if len(source_parts) >= 2 else source_parts[0]
+    clean_source = clean_source.replace('www', '').replace('-', '').replace('_', '').strip()
     source_tag = f"#{clean_source.capitalize()}" if clean_source else "#Джерело"
     hashtags.add(source_tag)
 
@@ -418,22 +419,24 @@ def generate_hashtags(title: str, source: str) -> str:
     # 4. Комбінування та фіналізація
     final_tags = []
     
-    # Додаємо джерело першим (вже в сеті)
-    final_tags.append(source_tag)
+    # Додаємо обов'язковий хештег #Новини першим
+    final_tags.append("#Новини")
+
+    # Додаємо хештег джерела
+    if source_tag not in final_tags:
+        final_tags.append(source_tag)
     
-    # Додаємо інші хештеги (до 4-х)
-    for tag in list(hashtags - {source_tag}): # Виключаємо Source Tag зі списку, щоб не дублювати 
-        if len(final_tags) < 5: # Обмеження до 5 тегів
-            final_tags.append(tag)
+    # Додаємо інші хештеги (до 5-ти всього)
+    for tag in list(hashtags - {source_tag}): 
+        if tag.lower() not in [t.lower() for t in final_tags]:
+            if len(final_tags) < 5: 
+                final_tags.append(tag)
             
-    # Додаємо обов'язковий хештег #Новини в кінець
-    if "#Новини" not in final_tags:
-         final_tags.append("#Новини")
     
     return " ".join(final_tags)
 
 # --- 5. ОСНОВНИЙ ПАРСИНГ ---
-# (Без змін, оскільки функціонал коректний)
+# ... (Без змін)
 
 async def fetch_and_parse_source(session: aiohttp.ClientSession, rss_url: str) -> List[Dict[str, Any]]:
     """Отримує, парсить та фільтрує новини з одного RSS-джерела."""
@@ -507,15 +510,14 @@ async def fetch_all_sources() -> Tuple[List[Dict[str, Any]], float]:
 # --- 6. ФОРМАТУВАННЯ ТА ПОСТИНГ (ОНОВЛЕНО) ---
 
 def format_news_post(news_item: Dict[str, Any]) -> str:
-    """Форматує новину для відправки в Telegram, видаляючи час публікації."""
+    """Форматує новину для відправки в Telegram, ВИДАЛЕНО ІНДЕКС ЧАСУ."""
     source_display = news_item['source'].replace('https://', '').replace('http://', '')
-    # ВИДАЛЕНО: published_time_str = news_item['published_at'].strftime(TIME_FORMAT)
     
     # Основний текст
     message = (
         f"<b>⚡️ {news_item['title']}</b>\n\n"
         f"{news_item['summary']}\n\n"
-        # ВИДАЛЕНО ЧАСОВИЙ ІНДЕКС ПЕРЕД "ПОДРОБИЦІ"
+        # ІНДЕКС ЧАСУ ПЕРЕД "ПОДРОБИЦІ" ВИДАЛЕНО
         f"<a href='{news_item['url']}'>Подробиці на {source_display}</a>"
     )
 
@@ -529,12 +531,12 @@ async def send_news_to_channel(news_to_post: List[Dict[str, Any]]) -> int:
     """Надсилає новини в Telegram-канал."""
     posted_urls = []
     
-    for news in news_to_post[:Config.MAX_NEWS_PER_CYCLE]:
+    # Використовуємо ліміт, який вже був застосований у get_unique_news_from_db
+    for news in news_to_post: 
         try:
             caption = format_news_post(news)
             
             if news.get('image_url'):
-                # Публікація з фото (Telegram має автоматично завантажити фото з URL)
                 await bot.send_photo(
                     chat_id=CHANNEL_ID,
                     photo=news['image_url'],
@@ -549,15 +551,13 @@ async def send_news_to_channel(news_to_post: List[Dict[str, Any]]) -> int:
         except TelegramAPIError as e:
             logger.error(f"❌ Telegram API Error для '{news['title'][:50]}...': {e.message}")
             if "Bad Request: chat not found" in e.message and ADMIN_ID:
-                 # Спроба надіслати повідомлення адміністратору
                  try:
                      await bot.send_message(ADMIN_ID, f"❌ Критична помилка: CHANNEL_ID ({CHANNEL_ID}) не знайдено або недійсний. Перевірте змінну оточення.", parse_mode=ParseMode.HTML)
                  except Exception:
                      pass
             
-            # Позначаємо як опубліковану, щоб не спамити, якщо проблема з URL фото
+            # Позначаємо як опубліковану, щоб не спамити
             if "Bad Request: failed to get HTTP URL content" in e.message or "Bad Request: PHOTO_INVALID" in e.message:
-                logger.warning("-> Проблема з URL зображення. Новина буде пропущена.")
                 posted_urls.append(news['url']) 
                 
             continue
@@ -568,7 +568,7 @@ async def send_news_to_channel(news_to_post: List[Dict[str, Any]]) -> int:
     await mark_news_as_posted(posted_urls)
     return len(posted_urls)
 
-# --- 7. ЦИКЛИ ТА КОМАНДИ АДМІНІСТРАТОРА ---
+# --- 7. ЦИКЛИ ТА КОМАНДИ АДМІНІСТРАТОРА (ОНОВЛЕНО) ---
 
 async def db_cleanup_loop():
     """Асинхронний цикл для періодичного очищення бази даних."""
@@ -578,28 +578,33 @@ async def db_cleanup_loop():
         await cleanup_db()
 
 async def auto_posting_loop(bot_instance: Bot):
-    """Головний цикл, який періодично перевіряє та публікує новини."""
-    # Інтервал очікування збільшено з 5 до 10 хвилин
+    """Головний цикл, який періодично перевіряє та публікує новини з поступовим збільшенням ліміту."""
+    global current_post_limit
     wait_time = Config.POSTING_INTERVAL_MIN * 60
+    
     while True:
         try:
             logger.info("--- 🚀 Запуск циклу автопостингу ---")
             
-            # 1. Парсинг і збереження новин
+            # 1. Парсинг і збереження новин (один раз на цикл)
             fetched_news, parse_duration = await fetch_all_sources()
             new_count = await save_news_to_db(fetched_news)
             logger.info(f"💾 Успішно вставлено {new_count} новин.")
 
-            # 2. Отримуємо новини для публікації (ТІЛЬКИ ТОП-3 З ФОТО І ВІКОМ < 30 ХВ)
-            news_to_post = await get_unique_news_from_db(Config.MAX_NEWS_PER_CYCLE)
+            # 2. Оновлення ліміту постів (поступове збільшення: 1, 2, 3, 3, 3...)
+            # Ліміт зростає до MAX_NEWS_PER_CYCLE (зараз 3)
+            current_post_limit = min(current_post_limit + 1, Config.MAX_NEWS_PER_CYCLE)
+
+            # 3. Отримуємо новини для публікації (ТІЛЬКИ ТОП-X З ФОТО)
+            news_to_post = await get_unique_news_from_db(current_post_limit)
             
-            # 3. Публікація 
+            # 4. Публікація 
             post_start_time = datetime.now()
             posted_count = await send_news_to_channel(news_to_post)
             post_duration = (datetime.now() - post_start_time).total_seconds()
             
             logger.info(
-                f"--- ✅ Цикл завершено. Нових: {new_count}. Постів: {posted_count}. Таймінги: Парсинг={parse_duration:.2f}с, Постинг={post_duration:.2f}с ---"
+                f"--- ✅ Цикл завершено. Нових: {new_count}. Поточний ліміт: {current_post_limit}. Опубліковано: {posted_count}. Таймінги: Парсинг={parse_duration:.2f}с, Постинг={post_duration:.2f}с ---"
             )
             
         except Exception as e:
@@ -609,10 +614,11 @@ async def auto_posting_loop(bot_instance: Bot):
         logger.info(f"Очікування {Config.POSTING_INTERVAL_MIN} хвилин...")
 
 
-# --- КОМАНДИ АДМІНІСТРАТОРА (Без змін) ---
+# --- КОМАНДИ АДМІНІСТРАТОРА (ОНОВЛЕНО) ---
 
 async def cmd_status(message: types.Message):
     """Показує поточний статус бота та конфігурацію."""
+    global current_post_limit
     config_msg = (
         "<b>🤖 Статус Платформи Новин:</b>\n\n"
         "<b>⚙️ Конфігурація:</b>\n"
@@ -620,6 +626,7 @@ async def cmd_status(message: types.Message):
         f"  ⏳ Інтервал: <b>{Config.POSTING_INTERVAL_MIN} хв</b> (Зменшення DB Compute Time)\n"
         f"  ⏱️ Макс. вік новини: {Config.MAX_AGE_MIN} хв\n"
         f"  📝 Макс. постів за цикл: <b>{Config.MAX_NEWS_PER_CYCLE}</b>\n"
+        f"  🔄 **Поточний ліміт постів:** <b>{current_post_limit}</b> (Зростаючий: 1, 2, 3...)\n"
         f"  📸 Вимога: Тільки пости <b>З ФОТО</b>\n"
         f"  🧹 Чистка DB: Раз на {Config.CLEANUP_INTERVAL_HOURS} год.\n"
         f"  📰 Джерел у списку: {len(Config.SOURCES)}\n\n"
@@ -631,6 +638,7 @@ async def cmd_status(message: types.Message):
 
 async def cmd_forcepost(message: types.Message):
     """Примусово запускає цикл парсингу та постингу."""
+    global current_post_limit
     await message.answer("♻️ Примусовий запуск циклу парсингу...")
     
     async def run_once(bot_instance):
@@ -640,7 +648,10 @@ async def cmd_forcepost(message: types.Message):
             fetched_news, parse_duration = await fetch_all_sources()
             new_count = await save_news_to_db(fetched_news)
             
-            news_to_post = await get_unique_news_from_db(Config.MAX_NEWS_PER_CYCLE) 
+            # Оновлення ліміту постів
+            current_post_limit = min(current_post_limit + 1, Config.MAX_NEWS_PER_CYCLE)
+
+            news_to_post = await get_unique_news_from_db(current_post_limit) 
             
             post_start_time = datetime.now()
             posted_count = await send_news_to_channel(news_to_post)
@@ -649,6 +660,7 @@ async def cmd_forcepost(message: types.Message):
             result_msg = (
                 "✅ <b>Цикл примусового постингу завершено!</b>\n"
                 f"   • Знайдено нових новин: {new_count}\n"
+                f"   • <b>Поточний ліміт постів: {current_post_limit}</b>\n"
                 f"   • Опубліковано новин: {posted_count}\n"
                 f"   • Таймінг (Парсинг): {parse_duration:.2f} сек\n"
                 f"   • Таймінг (Постинг): {post_duration:.2f} сек"
@@ -686,7 +698,6 @@ async def cmd_stats(message: types.Message):
 async def main():
     """Основна функція для ініціалізації та запуску бота через Webhook."""
     
-    # Перевірка всіх необхідних змінних
     if not all([BOT_TOKEN, DATABASE_URL, CHANNEL_ID, WEBHOOK_HOST, WEBHOOK_SECRET]):
         logger.critical("Критична помилка: Не задані BOT_TOKEN, DATABASE_URL, CHANNEL_ID, WEBHOOK_HOST або WEBHOOK_SECRET.")
         return
@@ -742,12 +753,13 @@ async def main():
         # 3. Запускаємо веб-сервер
         runner = web.AppRunner(app)
         await runner.setup()
+        # Використовуємо 0.0.0.0 і порт, наданий оточенням (PORT)
         site = web.TCPSite(runner, host=WEB_SERVER_HOST, port=WEB_SERVER_PORT)
         
         await site.start()
         logger.info(f"🌐 Веб-сервер запущено на {WEB_SERVER_HOST}:{WEB_SERVER_PORT}")
         
-        # Блокуємо головний потік, щоб він не завершився (поки працює веб-сервер)
+        # Блокуємо головний потік, щоб він не завершився
         await asyncio.Future() 
 
     except Exception as e:
