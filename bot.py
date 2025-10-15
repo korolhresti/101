@@ -5,7 +5,7 @@ import re
 import random
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urljoin
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Set
 
 import asyncpg
 import aiohttp
@@ -28,25 +28,26 @@ load_dotenv()
 
 # Використовуйте Kyiv time zone (UTC+3)
 KYIV_TZ = timezone(timedelta(hours=3), 'Europe/Kyiv')
-# Формат часу для відображення
+# Формат часу для відображення (ЗАЛИШИЛИ ТІЛЬКИ ДЛЯ ВНУТРІШНЬОГО ЛОГУВАННЯ)
 TIME_FORMAT = "%H:%M" 
 
 class Config:
     """Конфігурація платформи, зібрана в одному місці."""
     
     # ⚙️ ОСНОВНІ ПАРАМЕТРИ ЦИКЛУ
-    POSTING_INTERVAL_MIN = 5  # Кожні 5 хвилин
-    MAX_NEWS_PER_CYCLE = 3   # СТРОГИЙ ЛІМІТ: До 3 новин за цикл (ТОП-3)
-    MAX_AGE_MIN = 30          # Не публікувати новини старше 30 хвилин
+    # ЗМЕНШЕННЯ НАВАНТАЖЕННЯ НА DB: ЗМІНЕНО З 5 ХВ НА 10 ХВ
+    POSTING_INTERVAL_MIN = 10  # Кожні 10 хвилин
+    MAX_NEWS_PER_CYCLE = 3     # СТРОГИЙ ЛІМІТ: До 3 новин за цикл (ТОП-3)
+    MAX_AGE_MIN = 30           # Не публікувати новини старше 30 хвилин
     
     # 🛡️ ПАРАМЕТРИ НАДІЙНОСТІ ТА ПРОДУКТИВНОСТІ
-    FETCH_LIMIT = 30          # Макс. кількість записів для обробки з одного RSS-фіда
-    NUM_SOURCES_TO_FETCH = 24 # Кількість випадкових джерел, які парсяться за цикл
-    HTTP_TIMEOUT = 15         # Таймаут для HTTP-запитів
-    MAX_CONCURRENCY = 15      # Макс. одночасних з'єднань для парсингу
+    FETCH_LIMIT = 30           # Макс. кількість записів для обробки з одного RSS-фіда
+    NUM_SOURCES_TO_FETCH = 24  # Кількість випадкових джерел, які парсяться за цикл
+    HTTP_TIMEOUT = 15          # Таймаут для HTTP-запитів
+    MAX_CONCURRENCY = 15       # Макс. одночасних з'єднань для парсингу
     
     # 💾 ПАРАМЕТРИ ОБСЛУГОВУВАННЯ БАЗИ ДАНИХ
-    DB_CLEANUP_DAYS = 7       # Видаляти записи старше 7 днів
+    DB_CLEANUP_DAYS = 7        # Видаляти записи старше 7 днів
     CLEANUP_INTERVAL_HOURS = 1 # Частота очистки БД
     
     DEFAULT_HEADERS = {
@@ -79,7 +80,7 @@ logger = logging.getLogger(__name__)
 
 # --- WEBHOOK І СЕРВІСНІ ЗМІННІ СЕРЕДОВИЩА ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = os.getenv("DATABASE_URL") # ЗАЛИШАЄМО, БО БЕЗ DB НЕМОЖЛИВО ЗБЕРЕГТИ СТАН
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
 # Webhook конфігурація
@@ -102,6 +103,10 @@ dp: Dispatcher = None
 bot: Bot = None
 
 # --- 2. БАЗА ДАНИХ (POSTGRESQL/NEON) ---
+# Функції DB залишаються, оскільки вони необхідні для:
+# 1. Запобігання дублюванню новин (UNIQUE NOT NULL url)
+# 2. Збереження стану "опубліковано/не опубліковано" (is_posted)
+# 3. Черги новин між циклами (WHERE is_posted = FALSE)
 
 async def connect_db():
     """Створює пул з'єднань до PostgreSQL."""
@@ -114,15 +119,13 @@ async def connect_db():
         db_pool = await asyncpg.create_pool(
             DATABASE_URL,
             min_size=1, 
-            max_size=10,
+            max_size=5, # Зменшення максимального розміру пулу
             timeout=5 
         )
         logger.info("✅ Успішно підключено до Neon PostgreSQL.")
     except Exception as e:
         logger.error(f"❌ Критична помилка підключення до DB: {e}")
         await asyncio.sleep(60)
-        # Використовуємо sys.exit(1) для PaaS-платформ
-        # import sys; sys.exit(1) 
         exit(1)
 
 async def init_db():
@@ -162,6 +165,7 @@ async def save_news_to_db(news_items: List[Dict[str, Any]]) -> int:
     if not news_items or not db_pool:
         return 0
     
+    # Використовуємо UNNEST для пакетної вставки, що є більш ефективним (менше операцій на DB)
     sql = """
         INSERT INTO news (source, url, title, summary, image_url, published_at)
         SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[])
@@ -189,18 +193,22 @@ async def get_unique_news_from_db(limit: int) -> List[Dict[str, Any]]:
     if not db_pool:
         return []
 
+    # Забезпечуємо, що ми беремо лише ті новини, які відповідають критеріям (новіші 30 хв)
+    max_age_dt = datetime.now(KYIV_TZ) - timedelta(minutes=Config.MAX_AGE_MIN)
+    
     sql = """
         SELECT url, title, summary, image_url, source, published_at
         FROM news
         WHERE is_posted = FALSE
           AND image_url IS NOT NULL AND image_url != '' 
+          AND published_at >= $2 -- Додаємо фільтр за віком на рівні DB
         ORDER BY 
             published_at DESC 
         LIMIT $1;
     """
     try:
         async with db_pool.acquire() as conn:
-            records = await conn.fetch(sql, limit)
+            records = await conn.fetch(sql, limit, max_age_dt)
             return [dict(record) for record in records]
     except asyncpg.exceptions.PostgresError as e:
         logger.error(f"❌ Помилка вибірки з БД: {e}")
@@ -245,6 +253,7 @@ async def cleanup_db():
 
 async def get_db_stats() -> Dict[str, Any]:
     """Повертає статистику по записах у БД."""
+    # Функція залишається для адмін-команди /stats
     if not db_pool:
         return {}
         
@@ -264,6 +273,7 @@ async def get_db_stats() -> Dict[str, Any]:
         return {}
 
 # --- 3. ХЕЛПЕРИ ПАРСИНГУ ---
+# (Без змін, оскільки вони коректні)
 
 def is_news_relevant(title: str, summary: str) -> bool:
     """Фільтрує новини за нерелевантними ключовими словами (Шоу-бізнес, Спорт)."""
@@ -354,44 +364,76 @@ def parse_published_time(entry: feedparser.FeedParserDict) -> datetime:
     # Якщо час не знайдено, використовуємо поточний час
     return datetime.now(KYIV_TZ)
 
-# --- 4. ГЕНЕРАЦІЯ ХЕШТЕГІВ ---
+# --- 4. ГЕНЕРАЦІЯ ХЕШТЕГІВ (ОНОВЛЕНО) ---
 
 def generate_hashtags(title: str, source: str) -> str:
-    """Генерує до 5 релевантних хештегів на основі заголовка та джерела."""
+    """Генерує хештеги відповідно до нових вимог: #Новини, #Source, #People, #Location, #Organization."""
     
-    # Стоп-слова (базовий набір)
+    # Базові стоп-слова
     stop_words = set([
         'на', 'в', 'у', 'з', 'до', 'про', 'від', 'для', 'це', 'що', 'як',
         'та', 'але', 'і', 'по', 'за', 'під', 'над', 'коли', 'буде', 'було', 'є',
-        'він', 'вона', 'воно', 'вони', 'ми', 'ви', 'тисяч', 'мільйонів', 'може' 
+        'він', 'вона', 'воно', 'вони', 'ми', 'ви', 'тисяч', 'мільйонів', 'може', 
+        'які', 'який', 'яка', 'щодо', 'зі', 'через', 'поки'
     ])
     
-    # 1. Очистка та нормалізація заголовка
-    clean_title = re.sub(r'[^\w\s]', '', title).lower()
+    # Пріоритетні назви (наприклад, міста, організації, відомі особи)
+    priority_keywords = {
+        'Київ', 'Львів', 'Харків', 'Одеса', 'Дніпро', 'Запоріжжя', 'Херсон', 
+        'ЗСУ', 'СБУ', 'ГУР', 'НАТО', 'ЄС', 'ООН', 'Рада', 'Кабмін', 'Президент', 
+        'Зеленський', 'Шмигаль', 'Сирський', 'Буданов', 'Путін', 'Байден', 'Трамп',
+        'США', 'Україна', 'росія', 'кремль', 'міністр', 'поліція', 'суд'
+    }
+    
+    hashtags: Set[str] = set()
+    
+    # 1. Формування хештегу джерела
+    # Очищаємо домен (напр., www.pravda.com.ua -> Pravda)
+    clean_source = source.split('.')[0].replace('www', '').replace('-', '').replace('_', '').strip()
+    source_tag = f"#{clean_source.capitalize()}" if clean_source else "#Джерело"
+    hashtags.add(source_tag)
+
+    # 2. Очистка та нормалізація заголовка
+    clean_title = re.sub(r'[^\w\s]', '', title)
     words = clean_title.split()
     
-    # 2. Фільтрація слів
-    # Залишаємо слова довше 3 символів та не стоп-слова
-    filtered_words = [word for word in words if word not in stop_words and len(word) > 3]
+    # 3. Вилучення ключових слів (імена, місця, організації)
+    for i, word in enumerate(words):
+        # Нормалізація
+        lower_word = word.lower()
+        
+        # Фільтрація: слово довше 3 символів, не стоп-слово
+        if len(word) > 3 and lower_word not in stop_words:
+            
+            # Перевірка на пріоритетні слова (міста, організації, відомі особи)
+            if word in priority_keywords or word.capitalize() in priority_keywords:
+                hashtags.add(f"#{word.capitalize()}")
+                continue
+                
+            # Простий евристичний пошук: слово з великої літери (потенційне ім'я/місце/організація)
+            # яке не є першим словом у реченні (бо воно завжди з великої)
+            if word[0].isupper() and i > 0:
+                hashtags.add(f"#{word.capitalize()}")
     
-    # 3. Формування хештегу джерела
-    # Очищаємо домен (напр., pravda.com.ua -> Pravda)
-    clean_source = source.split('.')[0].replace('-', '').replace('_', '')
-    source_tag = f"#{clean_source.capitalize()}"
-
-    # 4. Формування хештегів з заголовка
-    # Беремо перші 3-4 унікальні слова
-    unique_words = list(set(filtered_words))[:4]
-    title_tags = [f"#{word.capitalize()}" for word in unique_words]
+    # 4. Комбінування та фіналізація
+    final_tags = []
     
-    # 5. Комбінування
-    # Додаємо загальні хештеги в кінець
-    all_tags = [source_tag] + title_tags
-    all_tags = list(dict.fromkeys(all_tags)) # Зберігаємо порядок, видаляємо дублікати
+    # Додаємо джерело першим (вже в сеті)
+    final_tags.append(source_tag)
     
-    return " ".join(all_tags[:5]) + " #НовиниУкраїни #Новини"
+    # Додаємо інші хештеги (до 4-х)
+    for tag in list(hashtags - {source_tag}): # Виключаємо Source Tag зі списку, щоб не дублювати 
+        if len(final_tags) < 5: # Обмеження до 5 тегів
+            final_tags.append(tag)
+            
+    # Додаємо обов'язковий хештег #Новини в кінець
+    if "#Новини" not in final_tags:
+         final_tags.append("#Новини")
+    
+    return " ".join(final_tags)
 
 # --- 5. ОСНОВНИЙ ПАРСИНГ ---
+# (Без змін, оскільки функціонал коректний)
 
 async def fetch_and_parse_source(session: aiohttp.ClientSession, rss_url: str) -> List[Dict[str, Any]]:
     """Отримує, парсить та фільтрує новини з одного RSS-джерела."""
@@ -462,18 +504,19 @@ async def fetch_all_sources() -> Tuple[List[Dict[str, Any]], float]:
     
     return all_news, duration
 
-# --- 6. ФОРМАТУВАННЯ ТА ПОСТИНГ ---
+# --- 6. ФОРМАТУВАННЯ ТА ПОСТИНГ (ОНОВЛЕНО) ---
 
 def format_news_post(news_item: Dict[str, Any]) -> str:
-    """Форматує новину для відправки в Telegram, включаючи хештеги."""
+    """Форматує новину для відправки в Telegram, видаляючи час публікації."""
     source_display = news_item['source'].replace('https://', '').replace('http://', '')
-    published_time_str = news_item['published_at'].strftime(TIME_FORMAT)
+    # ВИДАЛЕНО: published_time_str = news_item['published_at'].strftime(TIME_FORMAT)
     
     # Основний текст
     message = (
         f"<b>⚡️ {news_item['title']}</b>\n\n"
         f"{news_item['summary']}\n\n"
-        f"🕰️ {published_time_str} | <a href='{news_item['url']}'>Подробиці на {source_display}</a>"
+        # ВИДАЛЕНО ЧАСОВИЙ ІНДЕКС ПЕРЕД "ПОДРОБИЦІ"
+        f"<a href='{news_item['url']}'>Подробиці на {source_display}</a>"
     )
 
     # Генерація та додавання хештегів
@@ -529,7 +572,6 @@ async def send_news_to_channel(news_to_post: List[Dict[str, Any]]) -> int:
 
 async def db_cleanup_loop():
     """Асинхронний цикл для періодичного очищення бази даних."""
-    # Нескінченний цикл, який запускається після ініціалізації бота
     while True:
         await asyncio.sleep(Config.CLEANUP_INTERVAL_HOURS * 3600) 
         logger.info("--- ♻️ Запуск фонової очистки БД ---")
@@ -537,6 +579,8 @@ async def db_cleanup_loop():
 
 async def auto_posting_loop(bot_instance: Bot):
     """Головний цикл, який періодично перевіряє та публікує новини."""
+    # Інтервал очікування збільшено з 5 до 10 хвилин
+    wait_time = Config.POSTING_INTERVAL_MIN * 60
     while True:
         try:
             logger.info("--- 🚀 Запуск циклу автопостингу ---")
@@ -546,7 +590,7 @@ async def auto_posting_loop(bot_instance: Bot):
             new_count = await save_news_to_db(fetched_news)
             logger.info(f"💾 Успішно вставлено {new_count} новин.")
 
-            # 2. Отримуємо новини для публікації
+            # 2. Отримуємо новини для публікації (ТІЛЬКИ ТОП-3 З ФОТО І ВІКОМ < 30 ХВ)
             news_to_post = await get_unique_news_from_db(Config.MAX_NEWS_PER_CYCLE)
             
             # 3. Публікація 
@@ -561,11 +605,11 @@ async def auto_posting_loop(bot_instance: Bot):
         except Exception as e:
             logger.critical(f"❌ Критична помилка в циклі автопостингу: {e}", exc_info=True)
 
-        await asyncio.sleep(Config.POSTING_INTERVAL_MIN * 60)
+        await asyncio.sleep(wait_time)
         logger.info(f"Очікування {Config.POSTING_INTERVAL_MIN} хвилин...")
 
 
-# --- КОМАНДИ АДМІНІСТРАТОРА ---
+# --- КОМАНДИ АДМІНІСТРАТОРА (Без змін) ---
 
 async def cmd_status(message: types.Message):
     """Показує поточний статус бота та конфігурацію."""
@@ -573,7 +617,7 @@ async def cmd_status(message: types.Message):
         "<b>🤖 Статус Платформи Новин:</b>\n\n"
         "<b>⚙️ Конфігурація:</b>\n"
         f"  🌐 Режим: <b>WEBHOOK</b>\n"
-        f"  ⏳ Інтервал: {Config.POSTING_INTERVAL_MIN} хв\n"
+        f"  ⏳ Інтервал: <b>{Config.POSTING_INTERVAL_MIN} хв</b> (Зменшення DB Compute Time)\n"
         f"  ⏱️ Макс. вік новини: {Config.MAX_AGE_MIN} хв\n"
         f"  📝 Макс. постів за цикл: <b>{Config.MAX_NEWS_PER_CYCLE}</b>\n"
         f"  📸 Вимога: Тільки пости <b>З ФОТО</b>\n"
@@ -647,6 +691,7 @@ async def main():
         logger.critical("Критична помилка: Не задані BOT_TOKEN, DATABASE_URL, CHANNEL_ID, WEBHOOK_HOST або WEBHOOK_SECRET.")
         return
 
+    # Підключення до БД (ЗБЕРЕЖЕННЯ СТАНУ)
     await connect_db()
     if not db_pool:
         return
