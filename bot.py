@@ -171,7 +171,7 @@ async def save_news_with_transaction(news_items: List[Dict[str, Any]]) -> int:
     if not news_items or not db_pool: return 0
     sql = """
         INSERT INTO news (source, url, title, summary, image_url, published_at, post_vector)
-        SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], $7::tsvector[])
+        SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[], $6::timestamptz[], to_tsvector('simple', unnest($7::text[])))
         ON CONFLICT (url) DO NOTHING;
     """
     data = ([], [], [], [], [], [], [])
@@ -182,8 +182,10 @@ async def save_news_with_transaction(news_items: List[Dict[str, Any]]) -> int:
         data[3].append(item['summary'])
         data[4].append(item['image_url'])
         data[5].append(item['published_at'])
-        # Створюємо tsvector для майбутнього повнотекстового пошуку
-        data[6].append(f"to_tsvector('simple', '{item['title'].replace('''', '')} {item['summary'].replace('''', '')}')")
+        # **FIX:** Prepare a clean string for the tsvector without nested quotes.
+        # This approach is also safer against SQL injection.
+        clean_text_for_vector = f"{item['title']} {item['summary']}"
+        data[6].append(clean_text_for_vector)
 
     try:
         async with db_pool.acquire() as conn:
